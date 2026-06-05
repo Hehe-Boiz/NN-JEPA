@@ -9,6 +9,8 @@ __all__ = [
     "preprocess_all_sessions",
     "DrivingJEPADataset",
     "create_dataloaders",
+    "RCJepaACSequenceDataset",
+    "create_ac_sequence_dataloaders",
 ]
 
 
@@ -21,4 +23,12 @@ def __getattr__(name: str):
         from .dataset import create_dataloaders
 
         return create_dataloaders
+    if name == "RCJepaACSequenceDataset":
+        from .sequence_dataset import RCJepaACSequenceDataset
+
+        return RCJepaACSequenceDataset
+    if name == "create_ac_sequence_dataloaders":
+        from .sequence_dataset import create_ac_sequence_dataloaders
+
+        return create_ac_sequence_dataloaders
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

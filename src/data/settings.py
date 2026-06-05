@@ -69,6 +69,27 @@ ACTION_COLUMNS = (
 
 
 # ---------------------------------------------------------------------------
+# Action-conditioned JEPA world model defaults
+# Keep these separate from STATE_COLUMNS so the old single-step BC baseline can
+# still use the full state vector while the AC world model can drop weak inputs.
+# ---------------------------------------------------------------------------
+AC_STATE_COLUMNS = (
+    "yaw_rate_t",
+    "accel_x_t",
+    "accel_y_t",
+    "steering_last_t",
+    "throttle_last_t",
+)
+
+AC_ACTION_COLUMNS = ACTION_COLUMNS
+AC_RAW_FRAMES_PER_SAMPLE = 8
+AC_SEQUENCE_STRIDE = 1
+AC_IMAGE_SIZE = 384
+AC_TUBELET_SIZE = 2
+AC_AUTO_STEPS = 2
+
+
+# ---------------------------------------------------------------------------
 # How to read the current JEPA recorder CSV
 # Android onboard recorder:
 #   actions.csv   -> frame_idx,t_ms,steering,throttle,seq,esp_ms,mode

@@ -148,6 +148,46 @@ print(batch["state"].shape)
 print(batch["action"].shape)
 ```
 
+## Train baseline
+
+File mới:
+
+```text
+src/models/rc_car_model.py
+src/tools/train_rc_car.py
+```
+
+Baseline này nhận:
+
+- `image`
+- `state = [v_t, yaw_rate_t, accel_x_t, accel_y_t, steering_last_t, throttle_last_t]`
+
+và dự đoán:
+
+- `action = [steering_cmd_t, throttle_cmd_t]`
+
+Chạy bản đơn giản nhất:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_car
+```
+
+Nếu muốn đổi backbone ảnh sang V-JEPA 2.1 base và load checkpoint local:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_car \
+  --backbone vjepa2_1_vitb \
+  --vjepa-checkpoint /duong/dan/toi/checkpoint.pt \
+  --freeze-image-encoder
+```
+
+Model được viết theo kiểu dễ sửa:
+
+- `small_cnn`: CNN nhỏ để chạy baseline nhanh
+- `vjepa2_1_vitb`, `vjepa2_1_vitl`: bọc encoder local từ repo `vjepa2/`
+- `--sensor-names ...`: chọn sensor nào thực sự muốn dùng
+- output nằm ở `checkpoints/rc_car_bc/`
+
 ## Khi bạn muốn mở rộng
 
 Nếu sắp tới firmware/ESP32 hoặc logger của bạn ghi thêm tốt hơn:
