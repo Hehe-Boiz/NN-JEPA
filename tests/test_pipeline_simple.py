@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
+import tempfile
 import unittest
 
 from PIL import Image
@@ -9,9 +11,14 @@ import data.settings as settings
 from data.preprocess import (
     build_session_split,
     build_time_index,
+    find_actions_csv_file,
     match_sensor_rows,
+    merge_synced_imu_rows,
     read_action,
+    read_csv_rows,
     read_state,
+    read_timestamp,
+    read_timestamp_ms,
 )
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
@@ -102,6 +109,75 @@ class SimplePipelineTests(unittest.TestCase):
         self.assertAlmostEqual(state["steering_last_t"], 0.05)
         self.assertAlmostEqual(state["throttle_last_t"], 0.15)
         self.assertIn("steering_last_t", missing_columns)
+
+    def test_synced_rows_take_precedence_over_raw_streams(self) -> None:
+        row = {
+            "frame_idx": "7",
+            "t_scene_ms": "1000",
+            "steering": "0.11",
+            "throttle": "0.22",
+            "gz": "0.75",
+            "ax": "1.5",
+            "ay": "-0.4",
+        }
+        telemetry_rows = [
+            {"t_ms": "1000", "steering": "0.90", "throttle": "0.95", "seq": "1", "esp_ms": "100", "mode": "1"},
+        ]
+        accel_rows = [{"t_ms": "1000", "ax": "9.0", "ay": "8.0", "az": "7.0"}]
+        gyro_rows = [{"t_ms": "1000", "gx": "0.1", "gy": "0.2", "gz": "9.9"}]
+
+        aux_streams = {
+            "telemetry": build_time_index(telemetry_rows),
+            "accel": build_time_index(accel_rows),
+            "gyro": build_time_index(gyro_rows),
+        }
+        sensor_rows = match_sensor_rows(aux_streams, 1000.0)
+        previous_action = {
+            "steering_cmd_t": 0.05,
+            "throttle_cmd_t": 0.15,
+        }
+
+        action = read_action(row, telemetry_row=sensor_rows["telemetry"])
+        state, _ = read_state(row, previous_action, sensor_rows=sensor_rows)
+
+        self.assertAlmostEqual(action["steering_cmd_t"], 0.11)
+        self.assertAlmostEqual(action["throttle_cmd_t"], 0.22)
+        self.assertAlmostEqual(state["yaw_rate_t"], 0.75)
+        self.assertAlmostEqual(state["accel_x_t"], 1.5)
+        self.assertAlmostEqual(state["accel_y_t"], -0.4)
+
+    def test_synced_timestamp_columns_are_supported(self) -> None:
+        row = {"t_scene_ms": "1234"}
+
+        self.assertAlmostEqual(read_timestamp_ms(row), 1234.0)
+        self.assertAlmostEqual(read_timestamp(row), 1.234)
+
+    def test_synced_csv_is_preferred_and_imu_rows_are_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            session_dir = Path(tmp_dir)
+            (session_dir / settings.ACTIONS_CSV_NAME).write_text(
+                "frame_idx,t_ms,steering,throttle\n1,1000,0.90,0.95\n",
+                encoding="utf-8",
+            )
+            (session_dir / settings.SYNCED_ACTIONS_CSV_NAME).write_text(
+                "frame_idx,t_scene_ms,steering,throttle,mode\n1,1000,0.11,0.22,1\n",
+                encoding="utf-8",
+            )
+            (session_dir / settings.SYNCED_IMU_CSV_NAME).write_text(
+                "frame_idx,t_scene_ms,gx,gy,gz,ax,ay,az,rx,ry,rz\n"
+                "1,1000,0.10,0.20,0.75,1.50,-0.40,9.80,0.0,0.0,0.0\n",
+                encoding="utf-8",
+            )
+
+            csv_path = find_actions_csv_file(session_dir)
+            rows = read_csv_rows(csv_path)
+            merged_rows, report = merge_synced_imu_rows(rows, csv_path=csv_path, session_dir=session_dir)
+
+            self.assertEqual(csv_path.name, settings.SYNCED_ACTIONS_CSV_NAME)
+            self.assertEqual(report["merged_synced_imu_rows"], 1)
+            self.assertEqual(report["missing_synced_imu_rows"], 0)
+            self.assertEqual(merged_rows[0]["gz"], "0.75")
+            self.assertEqual(merged_rows[0]["ax"], "1.50")
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_horizontal_flip_inverts_control_sensitive_columns(self) -> None:

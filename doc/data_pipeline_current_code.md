@@ -5,6 +5,10 @@
 > `telemetry.csv`, `accel.csv`, `gyro.csv`, `rotvec.csv`, `gps.csv`, `meta.json`.
 > Code pipeline hiện tại đã được cập nhật để dùng `actions.csv` làm mốc theo frame và ghép các
 > stream sensor theo `t_ms` gần nhất.
+>
+> Update tiếp theo ngày **2026-06-06**: repo `JEPA` bổ sung `src/sync.py` và xác định
+> **nguồn train chuẩn** là `actions_synced.csv` + `imu_synced.csv`.
+> Pipeline trong repo này hiện đã ưu tiên 2 file đó nếu có; `actions.csv` chỉ còn là fallback.
 
 File này giải thích chi tiết code data pipeline đang nằm ở:
 

@@ -54,6 +54,15 @@ def preprocess_all_sessions() -> dict[str, Any]:
         "raw_data_dir": str(settings.RAW_DATA_DIR),
         "processed_data_dir": str(settings.PROCESSED_DATA_DIR),
         "counts": manifest_counts,
+        "preferred_training_files": {
+            "actions": settings.SYNCED_ACTIONS_CSV_NAME,
+            "imu": settings.SYNCED_IMU_CSV_NAME,
+        },
+        "sync_fallback_sessions": sorted(
+            report["session_id"]
+            for report in session_reports
+            if report.get("action_source") != settings.SYNCED_ACTIONS_CSV_NAME
+        ),
         "sessions": {
             key: sorted(set(value))
             for key, value in manifest_sessions.items()
@@ -78,10 +87,12 @@ def preprocess_one_session(session_dir: Path) -> tuple[list[dict[str, Any]], dic
     frame_map = build_frame_map(session_dir / settings.FRAME_DIR_NAME)
     aux_streams = load_aux_streams(session_dir)
     rows = read_csv_rows(csv_path)
+    rows, synced_imu_report = merge_synced_imu_rows(rows, csv_path=csv_path, session_dir=session_dir)
 
     report = {
         "session_id": session_dir.name,
         "csv_file": csv_path.name,
+        "action_source": csv_path.name,
         "raw_rows": len(rows),
         "kept_rows": 0,
         "dropped_missing_frame": 0,
@@ -96,6 +107,7 @@ def preprocess_one_session(session_dir: Path) -> tuple[list[dict[str, Any]], dic
         "matched_gyro_rows": 0,
         "matched_gps_rows": 0,
     }
+    report.update(synced_imu_report)
 
     used_missing_state_columns: set[str] = set()
     seen_frame_indices: set[int] = set()
@@ -195,10 +207,63 @@ def preprocess_one_session(session_dir: Path) -> tuple[list[dict[str, Any]], dic
 
 
 def find_actions_csv_file(session_dir: Path) -> Path:
-    path = session_dir / settings.ACTIONS_CSV_NAME
-    if not path.exists():
-        raise FileNotFoundError(f"Missing {settings.ACTIONS_CSV_NAME} in {session_dir}")
-    return path
+    for filename in (settings.SYNCED_ACTIONS_CSV_NAME, settings.ACTIONS_CSV_NAME):
+        path = session_dir / filename
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"Missing {settings.SYNCED_ACTIONS_CSV_NAME} or {settings.ACTIONS_CSV_NAME} in {session_dir}"
+    )
+
+
+def merge_synced_imu_rows(
+    rows: list[dict[str, str]],
+    csv_path: Path,
+    session_dir: Path,
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+    if csv_path.name != settings.SYNCED_ACTIONS_CSV_NAME:
+        return rows, {
+            "merged_synced_imu_rows": 0,
+            "missing_synced_imu_rows": 0,
+        }
+
+    imu_path = session_dir / settings.SYNCED_IMU_CSV_NAME
+    if not imu_path.exists():
+        return rows, {
+            "merged_synced_imu_rows": 0,
+            "missing_synced_imu_rows": len(rows),
+        }
+
+    imu_rows = read_csv_rows(imu_path)
+    imu_by_frame_index: dict[int, dict[str, str]] = {}
+    for imu_row in imu_rows:
+        frame_index = read_frame_index_from_row(imu_row)
+        if frame_index is None:
+            continue
+        imu_by_frame_index[frame_index] = imu_row
+
+    merged_rows: list[dict[str, str]] = []
+    merged_count = 0
+    missing_count = 0
+    for row in rows:
+        frame_index = read_frame_index_from_row(row)
+        merged_row = dict(row)
+        imu_row = None if frame_index is None else imu_by_frame_index.get(frame_index)
+        if imu_row is None:
+            missing_count += 1
+        else:
+            for key, value in imu_row.items():
+                if key == "frame_idx":
+                    continue
+                if merged_row.get(key) in (None, "") and value not in (None, ""):
+                    merged_row[key] = value
+            merged_count += 1
+        merged_rows.append(merged_row)
+
+    return merged_rows, {
+        "merged_synced_imu_rows": merged_count,
+        "missing_synced_imu_rows": missing_count,
+    }
 
 
 def load_aux_streams(session_dir: Path) -> dict[str, dict[str, Any]]:
@@ -244,22 +309,30 @@ def read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
 
 
 def get_frame_index(row: dict[str, str], row_number: int) -> int | None:
+    frame_index = read_frame_index_from_row(row)
+    if frame_index is not None:
+        return frame_index
+    return row_number + 1
+
+
+def read_frame_index_from_row(row: dict[str, str]) -> int | None:
     for key in settings.FRAME_INDEX_KEYS:
         if key in row and row[key] not in (None, ""):
             try:
                 return int(float(row[key]))
             except ValueError:
                 return None
-    return row_number + 1
+    return None
 
 
 def read_timestamp(row: dict[str, str]) -> float | None:
-    value = row.get("t_ms")
-    if value not in (None, ""):
-        try:
-            return float(value) / 1000.0
-        except ValueError:
-            return None
+    for key in ("t_ms", "t_scene_ms"):
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value) / 1000.0
+            except ValueError:
+                return None
 
     for key in ("timestamp_sec", "t_scene", "t_pc"):
         value = row.get(key)
@@ -272,12 +345,13 @@ def read_timestamp(row: dict[str, str]) -> float | None:
 
 
 def read_timestamp_ms(row: dict[str, str]) -> float | None:
-    value = row.get("t_ms")
-    if value not in (None, ""):
-        try:
-            return float(value)
-        except ValueError:
-            return None
+    for key in ("t_ms", "t_scene_ms"):
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except ValueError:
+                return None
 
     value = row.get("timestamp_sec")
     if value not in (None, ""):
@@ -301,9 +375,12 @@ def read_action(
     telemetry_row: dict[str, str] | None = None,
 ) -> dict[str, float] | None:
     action: dict[str, float] = {}
+    prefer_row_values = uses_synced_action_row(row)
     for target_key, source_keys in settings.ACTION_SOURCE_KEYS.items():
         value = None
-        if settings.USE_RAW_TELEMETRY_FOR_ACTION and telemetry_row is not None:
+        if prefer_row_values:
+            value = read_first_float(row, source_keys)
+        if value is None and settings.USE_RAW_TELEMETRY_FOR_ACTION and telemetry_row is not None:
             value = read_first_float(telemetry_row, source_keys)
         if value is None:
             value = read_first_float(row, source_keys)
@@ -372,7 +449,7 @@ def keep_meta_fields(
 ) -> dict[str, Any]:
     sensor_rows = sensor_rows or {}
     meta: dict[str, Any] = {}
-    for key in ("t_ms", "t_pc", "t_scene", "latency", "seq", "esp_ms", "mode"):
+    for key in ("t_ms", "t_scene_ms", "t_pc", "t_scene", "latency", "seq", "esp_ms", "mode", "dcam_ms"):
         value = row.get(key)
         if value in (None, ""):
             continue
@@ -550,13 +627,22 @@ def read_state_value(
     sensor_rows = sensor_rows or {}
     source_keys = settings.STATE_SOURCE_KEYS[key]
 
+    value = read_first_float(row, source_keys)
+    if value is not None:
+        return value
+
     for stream_name in preferred_streams:
         stream_row = sensor_rows.get(stream_name)
         value = read_first_float(stream_row, source_keys)
         if value is not None:
             return value
 
-    return read_first_float(row, source_keys)
+    return None
+
+
+def uses_synced_action_row(row: dict[str, str]) -> bool:
+    value = row.get("t_scene_ms")
+    return value not in (None, "")
 
 
 def build_time_index(rows: list[dict[str, str]]) -> dict[str, list[Any]] | None:

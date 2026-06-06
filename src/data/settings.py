@@ -39,7 +39,9 @@ REPORT_DIR = PROCESSED_DATA_DIR / "reports"
 SESSION_GLOB = "session_*"
 FRAME_DIR_NAME = "frames"
 FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png")
+SYNCED_ACTIONS_CSV_NAME = "actions_synced.csv"
 ACTIONS_CSV_NAME = "actions.csv"
+SYNCED_IMU_CSV_NAME = "imu_synced.csv"
 TELEMETRY_CSV_NAME = "telemetry.csv"
 ACCEL_CSV_NAME = "accel.csv"
 GYRO_CSV_NAME = "gyro.csv"
@@ -102,7 +104,7 @@ AC_AUTO_STEPS = 2
 #   actions.csv   -> frame_idx,t_pc,t_scene,steering,throttle,latency,seq,esp_ms,mode
 # ---------------------------------------------------------------------------
 FRAME_INDEX_KEYS = ("frame_idx",)
-TIMESTAMP_KEYS = ("t_ms", "timestamp_sec", "t_scene", "t_pc")
+TIMESTAMP_KEYS = ("t_ms", "t_scene_ms", "timestamp_sec", "t_scene", "t_pc")
 
 ACTION_SOURCE_KEYS = {
     "steering_cmd_t": ("steering_cmd_t", "steering"),

@@ -1,10 +1,12 @@
 # NN-JEPA
 
 Pipeline dữ liệu này bám đúng repo `JEPA/` hiện có, và đã được cập nhật theo hướng **Android onboard recorder** mới.
+Khi session đã chạy `JEPA/src/sync.py`, preprocessing sẽ ưu tiên `actions_synced.csv` + `imu_synced.csv`;
+`actions.csv` gốc chỉ còn là fallback cho session cũ/chưa sync.
 
 Luồng hiện tại:
 
-`JEPA/data/raw/session_xxx/{frames, actions.csv, telemetry.csv, accel.csv, gyro.csv, rotvec.csv, gps.csv} -> preprocess -> manifest train/val/test -> Dataset/DataLoader`
+`JEPA/data/raw/session_xxx/{frames, actions_synced.csv, imu_synced.csv, actions.csv, telemetry.csv, accel.csv, gyro.csv, rotvec.csv, gps.csv} -> preprocess -> manifest train/val/test -> Dataset/DataLoader`
 
 Schema model vẫn giữ đúng mục tiêu của bạn:
 
@@ -78,9 +80,10 @@ rotvec.csv    -> t_ms,rx,ry,rz
 gps.csv       -> t_ms,lat,lon,alt,speed,bearing,acc
 ```
 
-Pipeline sẽ lấy `actions.csv` làm mốc theo frame, rồi ghép các stream phụ theo timestamp `t_ms` gần nhất. Mapping hiện tại:
+Pipeline sẽ ưu tiên `actions_synced.csv` làm mốc theo frame và trộn `imu_synced.csv` theo `frame_idx`.
+Nếu chưa có 2 file này, nó fallback sang `actions.csv` rồi ghép các stream phụ theo timestamp gần nhất. Mapping hiện tại:
 
-- `steering/throttle` ở `telemetry.csv` hoặc `actions.csv` -> `steering_cmd_t`, `throttle_cmd_t`
+- `steering/throttle` ở `actions_synced.csv` (ưu tiên) hoặc `telemetry.csv` / `actions.csv` -> `steering_cmd_t`, `throttle_cmd_t`
 - `gyro.csv.gz` -> `yaw_rate_t`
 - `accel.csv.ax` -> `accel_x_t`
 - `accel.csv.ay` -> `accel_y_t`
@@ -117,6 +120,14 @@ Mọi thứ cần hay đổi đều nằm ở [settings.py](/home/heheboiz/data/
 - augmentation: `BRIGHTNESS_JITTER`, `CONTRAST_JITTER`, `HORIZONTAL_FLIP_PROB`
 
 ## Chạy preprocessing
+
+Nên sync session trước:
+
+```bash
+python3 JEPA/src/sync.py
+```
+
+Rồi mới preprocess:
 
 ```bash
 PYTHONPATH=src python3 -m tools.preprocess_data
