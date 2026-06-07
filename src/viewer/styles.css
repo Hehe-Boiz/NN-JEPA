@@ -73,8 +73,25 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 button:hover {
   background: #1d2732;
+}
+
+button:disabled:hover {
+  background: #263341;
+}
+
+button.secondary {
+  background: #775142;
+}
+
+button.secondary:hover {
+  background: #684638;
 }
 
 .meta {
@@ -92,9 +109,46 @@ button:hover {
   font-size: 14px;
 }
 
+.ops-panel {
+  margin-top: 18px;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(247, 241, 230, 0.92);
+  border: 1px solid rgba(31, 29, 26, 0.08);
+  display: grid;
+  gap: 12px;
+}
+
+.ops-panel h2,
+.job-log-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.extract-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.extract-grid label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.job-status {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(38, 51, 65, 0.08);
+  color: #3b342e;
+  font-size: 14px;
+}
+
 .main {
   display: grid;
-  grid-template-rows: 1fr auto;
+  grid-template-rows: 1fr auto auto;
   min-width: 0;
 }
 
@@ -147,6 +201,37 @@ button:hover {
 .status {
   justify-content: space-between;
   color: #544d46;
+}
+
+.job-log-panel {
+  margin: 0 24px 24px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(31, 29, 26, 0.9);
+  color: #f7f1e6;
+  border: 1px solid rgba(31, 29, 26, 0.2);
+}
+
+.job-log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.job-log-header span {
+  color: #d9cbb9;
+  font-size: 13px;
+}
+
+#jobLog {
+  margin: 0;
+  min-height: 120px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font: 12px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
 @media (max-width: 960px) {

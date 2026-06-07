@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -10,10 +11,12 @@ from torch import nn
 
 
 DEFAULT_WANDB_PROJECT = "nn-jepa-rc"
+DEFAULT_WANDB_RESUME = "allow"
 DEFAULT_WANDB_WATCH_LOG = "gradients"
 DEFAULT_WANDB_WATCH_FREQ = 200
 DEFAULT_WANDB_GRAD_STATS_EVERY = 20
 DEFAULT_WANDB_PARAM_STATS_EVERY = 200
+WANDB_RUN_ID_FILENAME = "wandb_run_id.txt"
 
 
 def add_wandb_args(parser: Any) -> None:
@@ -21,6 +24,12 @@ def add_wandb_args(parser: Any) -> None:
     parser.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-run-id", default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        default=DEFAULT_WANDB_RESUME,
+        choices=["allow", "must", "never", "auto"],
+    )
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb-tags", nargs="*", default=[])
     parser.add_argument("--wandb-log-every", type=int, default=20)
@@ -42,15 +51,77 @@ def init_wandb(args: Any, config: dict[str, Any], job_type: str) -> Any | None:
             "or run training with `--no-wandb`."
         ) from exc
 
-    return wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name,
-        mode=args.wandb_mode,
-        job_type=job_type,
-        tags=args.wandb_tags,
-        config=config,
-    )
+    run_id = resolve_wandb_run_id(args)
+    resume_mode = getattr(args, "wandb_resume", DEFAULT_WANDB_RESUME)
+    if resume_mode == "must" and run_id is None:
+        raise ValueError(
+            "`--wandb-resume must` requires `--wandb-run-id`, or an existing "
+            f"`{WANDB_RUN_ID_FILENAME}` in `--output-dir` when `--resume-from` is set."
+        )
+
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_run_name,
+        "mode": args.wandb_mode,
+        "job_type": job_type,
+        "tags": args.wandb_tags,
+        "config": config,
+    }
+    if run_id is not None:
+        init_kwargs["id"] = run_id
+        init_kwargs["resume"] = resume_mode
+    elif resume_mode == "auto":
+        init_kwargs["resume"] = "auto"
+
+    run = wandb.init(**init_kwargs)
+    persist_wandb_run_id(args, run, job_type=job_type)
+    return run
+
+
+def wandb_run_id_path(args: Any) -> Path | None:
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir is None:
+        return None
+    return Path(output_dir) / WANDB_RUN_ID_FILENAME
+
+
+def read_saved_wandb_run_id(args: Any) -> str | None:
+    path = wandb_run_id_path(args)
+    if path is None or not path.exists():
+        return None
+
+    run_id = path.read_text(encoding="utf-8").strip()
+    return run_id or None
+
+
+def resolve_wandb_run_id(args: Any) -> str | None:
+    explicit_run_id = getattr(args, "wandb_run_id", None)
+    if explicit_run_id is not None:
+        run_id = str(explicit_run_id).strip()
+        if run_id:
+            return run_id
+
+    if getattr(args, "wandb_resume", DEFAULT_WANDB_RESUME) == "never":
+        return None
+
+    if getattr(args, "resume_from", None) is None:
+        return None
+
+    return read_saved_wandb_run_id(args)
+
+
+def persist_wandb_run_id(args: Any, run: Any | None, job_type: str) -> None:
+    if run is None or not job_type.startswith("train-"):
+        return
+
+    run_id = getattr(run, "id", None)
+    path = wandb_run_id_path(args)
+    if not run_id or path is None:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{run_id}\n", encoding="utf-8")
 
 
 def log_metrics(run: Any | None, metrics: dict[str, float], step: int | None = None) -> None:

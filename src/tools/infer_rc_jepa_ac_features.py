@@ -25,7 +25,7 @@ from tools.rc_jepa_ac_feature_runtime import (
 )
 
 
-DEFAULT_CHECKPOINT = Path("checkpoints/rc_jepa_ac_vitb_features/best.pt")
+DEFAULT_CHECKPOINT = Path("checkpoints/rc_jepa_ac_vitb_features_20260607/best.pt")
 
 
 def parse_args() -> argparse.Namespace:

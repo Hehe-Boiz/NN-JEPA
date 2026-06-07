@@ -150,7 +150,7 @@ def extract_session_features(
     dtype: np.dtype,
     device: torch.device,
     overwrite: bool,
-) -> None:
+) -> str:
     npy_path = sessions_dir / f"{session_id}.npy"
     json_path = sessions_dir / f"{session_id}.json"
     tokens_per_frame = encoder.tokens_per_frame
@@ -165,7 +165,7 @@ def extract_session_features(
                 f"Expected shape={expected_shape}, dtype={dtype}. "
                 "Use --overwrite or a different --output-dir."
             )
-        return
+        return "skipped_compatible"
 
     feature_array = np.lib.format.open_memmap(
         npy_path,
@@ -222,6 +222,80 @@ def extract_session_features(
             "frames": frames,
         },
     )
+    return "extracted"
+
+
+def read_existing_metadata(output_dir: Path) -> dict[str, Any] | None:
+    metadata_path = output_dir / FEATURE_METADATA_NAME
+    if not metadata_path.exists():
+        return None
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def metadata_matches_request(
+    metadata: dict[str, Any],
+    args: argparse.Namespace,
+    grouped: dict[str, list[dict[str, Any]]],
+    frame_count: int,
+) -> bool:
+    expected = {
+        "format_version": 1,
+        "feature_layout": "frame_tokens",
+        "encoder_name": args.encoder,
+        "checkpoint_path": str(args.vjepa_checkpoint),
+        "checkpoint_key": args.checkpoint_key,
+        "image_size": args.image_size,
+        "patch_size": args.patch_size,
+        "tubelet_size": args.tubelet_size,
+        "dtype": args.dtype,
+        "normalization_mean": list(settings.NORMALIZE_MEAN),
+        "normalization_std": list(settings.NORMALIZE_STD),
+        "manifest_dir": str(args.manifest_dir),
+        "splits": list(args.splits),
+        "session_count": len(grouped),
+        "frame_count": frame_count,
+    }
+    return all(metadata.get(key) == value for key, value in expected.items())
+
+
+def cache_status_from_metadata(
+    session_id: str,
+    session_samples: Sequence[dict[str, Any]],
+    sessions_dir: Path,
+    metadata: dict[str, Any],
+    dtype: np.dtype,
+) -> str:
+    npy_path = sessions_dir / f"{session_id}.npy"
+    json_path = sessions_dir / f"{session_id}.json"
+    if not npy_path.exists() or not json_path.exists():
+        return "missing"
+    try:
+        tokens_per_frame = int(metadata["tokens_per_frame"])
+        embed_dim = int(metadata["embed_dim"])
+        existing = np.load(npy_path, mmap_mode="r")
+    except (KeyError, OSError, ValueError):
+        return "incompatible"
+    expected_shape = (len(session_samples), tokens_per_frame, embed_dim)
+    if tuple(existing.shape) != expected_shape or np.dtype(existing.dtype) != dtype:
+        return "incompatible"
+    return "compatible"
+
+
+def cache_status_summary(
+    grouped: dict[str, list[dict[str, Any]]],
+    sessions_dir: Path,
+    metadata: dict[str, Any],
+    dtype: np.dtype,
+) -> dict[str, int]:
+    summary = {"compatible": 0, "missing": 0, "incompatible": 0}
+    for session_id, session_samples in grouped.items():
+        status = cache_status_from_metadata(session_id, session_samples, sessions_dir, metadata, dtype)
+        summary[status] += 1
+    return summary
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -235,13 +309,42 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     sessions_dir = args.output_dir / FEATURE_SESSIONS_DIR_NAME
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
-    encoder = build_encoder(args).to(device)
-    encoder.eval()
 
     samples = load_unique_samples(args.manifest_dir, args.splits)
     grouped = group_samples_by_session(samples)
     dtype = numpy_dtype(args.dtype)
+
+    if not args.overwrite:
+        existing_metadata = read_existing_metadata(args.output_dir)
+        if existing_metadata is not None and metadata_matches_request(
+            existing_metadata,
+            args=args,
+            grouped=grouped,
+            frame_count=len(samples),
+        ):
+            status_summary = cache_status_summary(grouped, sessions_dir, existing_metadata, dtype)
+            if status_summary["compatible"] == len(grouped):
+                print(
+                    json.dumps(
+                        {
+                            "status": "feature_cache_already_complete",
+                            "feature_summary": {
+                                "skipped_compatible": status_summary["compatible"],
+                                "extracted": 0,
+                                "missing": 0,
+                                "incompatible": 0,
+                            },
+                            "metadata": existing_metadata,
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                return
+
+    device = torch.device(args.device)
+    encoder = build_encoder(args).to(device)
+    encoder.eval()
 
     metadata = {
         "format_version": 1,
@@ -265,9 +368,10 @@ def main() -> None:
     write_json(args.output_dir / FEATURE_METADATA_NAME, metadata)
     print(json.dumps(metadata, indent=2), flush=True)
 
+    feature_summary = {"extracted": 0, "skipped_compatible": 0}
     with torch.no_grad():
         for session_id, session_samples in tqdm(grouped.items(), desc="sessions"):
-            extract_session_features(
+            status = extract_session_features(
                 session_id=session_id,
                 session_samples=session_samples,
                 encoder=encoder,
@@ -278,6 +382,8 @@ def main() -> None:
                 device=device,
                 overwrite=args.overwrite,
             )
+            feature_summary[status] = feature_summary.get(status, 0) + 1
+    print(json.dumps({"status": "feature_extraction_complete", "feature_summary": feature_summary}, indent=2), flush=True)
 
 
 if __name__ == "__main__":

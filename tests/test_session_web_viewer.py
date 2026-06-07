@@ -6,7 +6,16 @@ import unittest
 from unittest import mock
 
 from data import settings
-from tools.session_web_viewer import build_session_payload, collect_sessions, get_frames_dir, list_frame_paths
+from tools.session_web_viewer import (
+    build_extract_feature_command,
+    build_job_command,
+    build_preprocess_command,
+    build_session_payload,
+    build_sync_command,
+    collect_sessions,
+    get_frames_dir,
+    list_frame_paths,
+)
 
 
 class SessionWebViewerTests(unittest.TestCase):
@@ -66,6 +75,35 @@ class SessionWebViewerTests(unittest.TestCase):
             get_frames_dir("processed", "session_x"),
             settings.PROCESSED_IMAGE_DIR / "session_x",
         )
+
+    def test_web_job_commands_use_expected_tools(self) -> None:
+        sync_command = build_sync_command()
+        preprocess_command = build_preprocess_command()
+        feature_command = build_extract_feature_command(batch_size=16, num_workers=2)
+
+        self.assertIn("tools.sync_drive_data", sync_command)
+        self.assertIn("--check-zips", sync_command)
+        self.assertNotIn("--preprocess", sync_command)
+        self.assertIn("tools.preprocess_data", preprocess_command)
+        self.assertIn("tools.extract_vjepa_features", feature_command)
+        self.assertIn("--vjepa-checkpoint", feature_command)
+        self.assertIn("checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt", feature_command)
+        self.assertIn("--batch-size", feature_command)
+        self.assertIn("16", feature_command)
+        self.assertIn("--num-workers", feature_command)
+        self.assertIn("2", feature_command)
+
+    def test_build_job_command_rejects_bad_feature_args(self) -> None:
+        with self.assertRaises(ValueError):
+            build_job_command("extract_features", {"batch_size": 0})
+
+        with self.assertRaises(ValueError):
+            build_job_command("extract_features", {"num_workers": -1})
+
+        with self.assertRaises(ValueError):
+            build_job_command("unknown")
+
+        self.assertIn("tools.preprocess_data", build_job_command("preprocess"))
 
 
 if __name__ == "__main__":

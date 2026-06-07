@@ -23,7 +23,7 @@ from tools.train_rc_jepa_ac_features import run_epoch, write_json
 from tools.wandb_utils import add_wandb_args, finish_wandb, flatten_metrics, init_wandb, log_metrics, update_summary
 
 
-DEFAULT_CHECKPOINT = Path("checkpoints/rc_jepa_ac_vitb_features/best.pt")
+DEFAULT_CHECKPOINT = Path("checkpoints/rc_jepa_ac_vitb_features_20260607/best.pt")
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +95,7 @@ def main() -> None:
                     dataloader=dataloaders[split],
                     device=device,
                     optimizer=None,
+                    lr_scheduler=None,
                     grad_clip=0.0,
                     tokens_per_frame=config.tokens_per_frame,
                     auto_steps=config.auto_steps,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 import tempfile
 import unittest
 
@@ -19,7 +21,15 @@ if TORCH_AVAILABLE:
     from data.sequence_dataset import RCJepaACSequenceDataset, build_sequence_windows
     from models.rc_jepa_ac import SimpleACPredictor, build_rollout_state_context, compute_world_model_losses
     from tools.rc_jepa_ac_feature_runtime import config_from_checkpoint
-    from tools.train_rc_jepa_ac import compute_lr_scale, compute_warmup_steps, should_apply_early_stopping
+    from tools.train_rc_jepa_ac import (
+        build_lr_scheduler,
+        compute_lr_scale,
+        compute_warmup_steps,
+        should_apply_early_stopping,
+        sync_lr_scheduler,
+    )
+    from tools.wandb_utils import persist_wandb_run_id, read_saved_wandb_run_id, resolve_wandb_run_id
+    from tools.wandb_utils import init_wandb
 
 
 class RCJepaACTests(unittest.TestCase):
@@ -248,6 +258,43 @@ class RCJepaACTests(unittest.TestCase):
         self.assertAlmostEqual(final_scale, 0.1)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_pytorch_lr_scheduler_matches_scale_and_resume_step(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        scheduler = build_lr_scheduler(
+            optimizer=optimizer,
+            total_train_steps=12,
+            warmup_steps=6,
+            warmup_start_factor=0.1,
+            min_lr_ratio=0.1,
+        )
+
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-5)
+        optimizer.step()
+        scheduler.step()
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 2.5e-5)
+
+        sync_lr_scheduler(scheduler, global_step=6)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-4)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_pytorch_lr_scheduler_resume_uses_base_lr_not_loaded_optimizer_lr(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+        scheduler = build_lr_scheduler(
+            optimizer=optimizer,
+            total_train_steps=12,
+            warmup_steps=6,
+            warmup_start_factor=0.1,
+            min_lr_ratio=0.1,
+            base_lr=1e-4,
+        )
+
+        sync_lr_scheduler(scheduler, global_step=6)
+
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-4)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_early_stopping_starts_after_warmup(self) -> None:
         self.assertFalse(should_apply_early_stopping(epoch=1, warmup_epochs=1))
         self.assertTrue(should_apply_early_stopping(epoch=2, warmup_epochs=1))
@@ -285,6 +332,87 @@ class RCJepaACTests(unittest.TestCase):
         self.assertEqual(config.predictor_heads, 4)
         self.assertEqual(config.tokens_per_frame, 4)
         self.assertEqual(config.embed_dim, 8)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_wandb_run_id_is_saved_and_reused_only_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            args = SimpleNamespace(
+                output_dir=output_dir,
+                resume_from=None,
+                wandb_run_id=None,
+                wandb_resume="allow",
+            )
+            run = SimpleNamespace(id="abc123")
+
+            persist_wandb_run_id(args, run, job_type="train-rc-jepa-ac-features")
+
+            self.assertEqual(read_saved_wandb_run_id(args), "abc123")
+            self.assertIsNone(resolve_wandb_run_id(args))
+
+            resume_args = SimpleNamespace(
+                output_dir=output_dir,
+                resume_from=output_dir / "last.pt",
+                wandb_run_id=None,
+                wandb_resume="allow",
+            )
+            self.assertEqual(resolve_wandb_run_id(resume_args), "abc123")
+
+            no_resume_args = SimpleNamespace(
+                output_dir=output_dir,
+                resume_from=output_dir / "last.pt",
+                wandb_run_id=None,
+                wandb_resume="never",
+            )
+            self.assertIsNone(resolve_wandb_run_id(no_resume_args))
+
+            explicit_args = SimpleNamespace(
+                output_dir=output_dir,
+                resume_from=None,
+                wandb_run_id="manual456",
+                wandb_resume="allow",
+            )
+            self.assertEqual(resolve_wandb_run_id(explicit_args), "manual456")
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_init_wandb_passes_saved_run_id_to_wandb_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            (output_dir / "wandb_run_id.txt").write_text("abc123\n", encoding="utf-8")
+            captured_kwargs = {}
+
+            def fake_init(**kwargs: object) -> SimpleNamespace:
+                captured_kwargs.update(kwargs)
+                return SimpleNamespace(id=kwargs.get("id", "new-run"))
+
+            fake_wandb = SimpleNamespace(init=fake_init)
+            missing = object()
+            old_wandb = sys.modules.get("wandb", missing)
+            sys.modules["wandb"] = fake_wandb
+            try:
+                args = SimpleNamespace(
+                    no_wandb=False,
+                    wandb_mode="online",
+                    wandb_project="nn-jepa-rc",
+                    wandb_entity=None,
+                    wandb_run_name=None,
+                    wandb_run_id=None,
+                    wandb_resume="allow",
+                    wandb_tags=[],
+                    output_dir=output_dir,
+                    resume_from=output_dir / "last.pt",
+                )
+
+                init_wandb(args, config={"a": 1}, job_type="train-rc-jepa-ac-features")
+            finally:
+                if old_wandb is missing:
+                    del sys.modules["wandb"]
+                else:
+                    sys.modules["wandb"] = old_wandb
+
+            self.assertEqual(captured_kwargs["id"], "abc123")
+            self.assertEqual(captured_kwargs["resume"], "allow")
+            self.assertEqual(captured_kwargs["project"], "nn-jepa-rc")
 
 
 def make_manifest_sample(session_id: str, frame_index: int, image_path: Path) -> dict[str, object]:

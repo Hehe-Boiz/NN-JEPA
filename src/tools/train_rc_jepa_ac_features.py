@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 
 from data import settings
@@ -37,10 +38,11 @@ from tools.train_rc_jepa_ac import (
     DEFAULT_WARMUP_EPOCHS,
     DEFAULT_WARMUP_START_FACTOR,
     DEFAULT_WEIGHT_DECAY,
-    apply_learning_rate,
+    build_lr_scheduler,
     compute_steps_per_epoch,
     compute_warmup_steps,
     should_apply_early_stopping,
+    sync_lr_scheduler,
 )
 from tools.wandb_utils import (
     add_wandb_args,
@@ -56,7 +58,7 @@ from tools.wandb_utils import (
 
 
 DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp32"
-DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_features")
+DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_vitb_features_20260607")
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +128,7 @@ def run_epoch(
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    lr_scheduler: LambdaLR | None,
     grad_clip: float,
     tokens_per_frame: int,
     auto_steps: int,
@@ -138,11 +141,6 @@ def run_epoch(
     wandb_log_every: int = 0,
     epoch: int | None = None,
     global_step_start: int = 0,
-    base_lr: float | None = None,
-    total_train_steps: int = 0,
-    warmup_steps: int = 0,
-    warmup_start_factor: float = DEFAULT_WARMUP_START_FACTOR,
-    min_lr_ratio: float = DEFAULT_MIN_LR_RATIO,
     wandb_grad_stats_every: int = 0,
     wandb_param_stats_every: int = 0,
 ) -> tuple[dict[str, float], int]:
@@ -174,17 +172,9 @@ def run_epoch(
         actions = batch["actions"].to(device, non_blocking=True)
 
         if training:
-            if optimizer is None or base_lr is None:
-                raise RuntimeError("Training epoch requires optimizer and base_lr")
-            current_lr = apply_learning_rate(
-                optimizer=optimizer,
-                base_lr=base_lr,
-                global_step=global_step,
-                total_train_steps=total_train_steps,
-                warmup_steps=warmup_steps,
-                warmup_start_factor=warmup_start_factor,
-                min_lr_ratio=min_lr_ratio,
-            )
+            if optimizer is None or lr_scheduler is None:
+                raise RuntimeError("Training epoch requires optimizer and lr_scheduler")
+            current_lr = float(lr_scheduler.get_last_lr()[0])
             optimizer.zero_grad(set_to_none=True)
         else:
             current_lr = None
@@ -213,6 +203,7 @@ def run_epoch(
                 if should_log_grad_stats:
                     extra_batch_metrics.update(collect_gradient_metrics(predictor, prefix="grad_post_clip"))
                 optimizer.step()
+                lr_scheduler.step()
                 if should_log_param_stats:
                     extra_batch_metrics.update(collect_parameter_metrics(predictor, prefix="param"))
 
@@ -284,6 +275,7 @@ def save_checkpoint(
     path: Path,
     predictor: SimpleACPredictor,
     optimizer: torch.optim.Optimizer,
+    lr_scheduler: LambdaLR | None,
     epoch: int,
     args: argparse.Namespace,
     metrics: dict[str, Any],
@@ -301,6 +293,7 @@ def save_checkpoint(
         "phase": phase,
         "predictor_state_dict": predictor.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "lr_scheduler_state_dict": None if lr_scheduler is None else lr_scheduler.state_dict(),
         "args": args_to_jsonable_dict(args),
         "metrics": metrics,
         "state_columns": list(args.state_columns),
@@ -396,26 +389,38 @@ def main() -> None:
     resumed_from = None
     resume_phase = "train"
     resumed_train_metrics: dict[str, float] | None = None
+    resume_checkpoint: dict[str, Any] | None = None
     if args.resume_from is not None:
         resumed_from = args.resume_from
-        checkpoint = load_resume_checkpoint(args.resume_from, predictor, optimizer, device)
-        resume_phase = str(checkpoint.get("phase", "epoch_complete"))
+        resume_checkpoint = load_resume_checkpoint(args.resume_from, predictor, optimizer, device)
+        resume_phase = str(resume_checkpoint.get("phase", "epoch_complete"))
         if resume_phase == "train_complete_waiting_val":
-            start_epoch = int(checkpoint["epoch"])
-            metrics_payload = checkpoint.get("metrics", {})
+            start_epoch = int(resume_checkpoint["epoch"])
+            metrics_payload = resume_checkpoint.get("metrics", {})
             resumed_train_metrics = dict(metrics_payload.get("train", {}))
         else:
-            start_epoch = int(checkpoint["epoch"]) + 1
-        best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
-        best_epoch = int(checkpoint.get("best_epoch", 0))
-        global_step = int(checkpoint.get("global_step", 0))
-        epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", 0))
-        history = list(checkpoint.get("history", []))
+            start_epoch = int(resume_checkpoint["epoch"]) + 1
+        best_val_loss = float(resume_checkpoint.get("best_val_loss", best_val_loss))
+        best_epoch = int(resume_checkpoint.get("best_epoch", 0))
+        global_step = int(resume_checkpoint.get("global_step", 0))
+        epochs_without_improvement = int(resume_checkpoint.get("epochs_without_improvement", 0))
+        history = list(resume_checkpoint.get("history", []))
         if start_epoch > args.epochs:
             raise ValueError(
-                f"Resume checkpoint already finished epoch {checkpoint['epoch']}, "
+                f"Resume checkpoint already finished epoch {resume_checkpoint['epoch']}, "
                 f"but --epochs={args.epochs}. Increase --epochs to continue."
             )
+    lr_scheduler = build_lr_scheduler(
+        optimizer=optimizer,
+        total_train_steps=total_train_steps,
+        warmup_steps=warmup_steps,
+        warmup_start_factor=args.warmup_start_factor,
+        min_lr_ratio=args.min_lr_ratio,
+        base_lr=args.lr,
+    )
+    if resume_checkpoint is not None and resume_checkpoint.get("lr_scheduler_state_dict") is not None:
+        lr_scheduler.load_state_dict(resume_checkpoint["lr_scheduler_state_dict"])
+    sync_lr_scheduler(lr_scheduler, global_step)
 
     wandb_run = init_wandb(args, config=run_config, job_type="train-rc-jepa-ac-features")
     watch_model(wandb_run, predictor, args)
@@ -431,6 +436,7 @@ def main() -> None:
                     dataloader=dataloaders["train"],
                     device=device,
                     optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
                     grad_clip=args.grad_clip,
                     tokens_per_frame=tokens_per_frame,
                     auto_steps=args.auto_steps,
@@ -443,11 +449,6 @@ def main() -> None:
                     wandb_log_every=args.wandb_log_every,
                     epoch=epoch,
                     global_step_start=global_step,
-                    base_lr=args.lr,
-                    total_train_steps=total_train_steps,
-                    warmup_steps=warmup_steps,
-                    warmup_start_factor=args.warmup_start_factor,
-                    min_lr_ratio=args.min_lr_ratio,
                     wandb_grad_stats_every=args.wandb_grad_stats_every,
                     wandb_param_stats_every=args.wandb_param_stats_every,
                 )
@@ -456,6 +457,7 @@ def main() -> None:
                     args.output_dir / "last_train.pt",
                     predictor,
                     optimizer,
+                    lr_scheduler,
                     epoch,
                     args,
                     train_only_metrics,
@@ -475,6 +477,7 @@ def main() -> None:
                     dataloader=dataloaders["val"],
                     device=device,
                     optimizer=None,
+                    lr_scheduler=None,
                     grad_clip=args.grad_clip,
                     tokens_per_frame=tokens_per_frame,
                     auto_steps=args.auto_steps,
@@ -511,6 +514,7 @@ def main() -> None:
                     checkpoint_path,
                     predictor,
                     optimizer,
+                    lr_scheduler,
                     epoch,
                     args,
                     epoch_metrics,
@@ -528,6 +532,7 @@ def main() -> None:
                     args.output_dir / "best.pt",
                     predictor,
                     optimizer,
+                    lr_scheduler,
                     epoch,
                     args,
                     epoch_metrics,
@@ -583,6 +588,7 @@ def main() -> None:
                 dataloader=dataloaders["test"],
                 device=device,
                 optimizer=None,
+                lr_scheduler=None,
                 grad_clip=args.grad_clip,
                 tokens_per_frame=tokens_per_frame,
                 auto_steps=args.auto_steps,

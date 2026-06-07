@@ -12,6 +12,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 
 from data import settings
@@ -170,26 +171,41 @@ def compute_lr_scale(
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
-def apply_learning_rate(
+def build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
-    base_lr: float,
-    global_step: int,
     total_train_steps: int,
     warmup_steps: int,
     warmup_start_factor: float,
     min_lr_ratio: float,
-) -> float:
-    lr_scale = compute_lr_scale(
-        step=global_step,
-        total_train_steps=total_train_steps,
-        warmup_steps=warmup_steps,
-        warmup_start_factor=warmup_start_factor,
-        min_lr_ratio=min_lr_ratio,
+    base_lr: float | None = None,
+) -> LambdaLR:
+    if base_lr is not None:
+        for param_group in optimizer.param_groups:
+            param_group["initial_lr"] = base_lr
+            param_group["lr"] = base_lr
+    return LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: compute_lr_scale(
+            step=step,
+            total_train_steps=total_train_steps,
+            warmup_steps=warmup_steps,
+            warmup_start_factor=warmup_start_factor,
+            min_lr_ratio=min_lr_ratio,
+        ),
     )
-    lr = base_lr * lr_scale
-    for param_group in optimizer.param_groups:
+
+
+def sync_lr_scheduler(lr_scheduler: LambdaLR, global_step: int) -> None:
+    """Move LambdaLR to the exact step stored in a checkpoint."""
+    global_step = max(int(global_step), 0)
+    lr_scheduler.last_epoch = global_step
+    lrs = [
+        base_lr * lr_lambda(global_step)
+        for base_lr, lr_lambda in zip(lr_scheduler.base_lrs, lr_scheduler.lr_lambdas)
+    ]
+    for param_group, lr in zip(lr_scheduler.optimizer.param_groups, lrs):
         param_group["lr"] = lr
-    return lr
+    lr_scheduler._last_lr = lrs
 
 
 def run_epoch(
@@ -197,6 +213,7 @@ def run_epoch(
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    lr_scheduler: LambdaLR | None,
     grad_clip: float,
     label: str,
     show_progress: bool,
@@ -205,11 +222,6 @@ def run_epoch(
     wandb_log_every: int = 0,
     epoch: int | None = None,
     global_step_start: int = 0,
-    base_lr: float | None = None,
-    total_train_steps: int = 0,
-    warmup_steps: int = 0,
-    warmup_start_factor: float = DEFAULT_WARMUP_START_FACTOR,
-    min_lr_ratio: float = DEFAULT_MIN_LR_RATIO,
     wandb_grad_stats_every: int = 0,
     wandb_param_stats_every: int = 0,
 ) -> tuple[dict[str, float], int]:
@@ -247,17 +259,9 @@ def run_epoch(
         actions = batch["actions"].to(device, non_blocking=True)
 
         if training:
-            if optimizer is None or base_lr is None:
-                raise RuntimeError("Training epoch requires optimizer and base_lr")
-            current_lr = apply_learning_rate(
-                optimizer=optimizer,
-                base_lr=base_lr,
-                global_step=global_step,
-                total_train_steps=total_train_steps,
-                warmup_steps=warmup_steps,
-                warmup_start_factor=warmup_start_factor,
-                min_lr_ratio=min_lr_ratio,
-            )
+            if optimizer is None or lr_scheduler is None:
+                raise RuntimeError("Training epoch requires optimizer and lr_scheduler")
+            current_lr = float(lr_scheduler.get_last_lr()[0])
             optimizer.zero_grad(set_to_none=True)
         else:
             current_lr = None
@@ -278,6 +282,7 @@ def run_epoch(
                 if should_log_grad_stats:
                     extra_batch_metrics.update(collect_gradient_metrics(model, prefix="grad_post_clip"))
                 optimizer.step()
+                lr_scheduler.step()
                 if should_log_param_stats:
                     extra_batch_metrics.update(collect_parameter_metrics(model, prefix="param"))
 
@@ -315,6 +320,7 @@ def save_checkpoint(
     path: Path,
     model: RCJepaACWorldModel,
     optimizer: torch.optim.Optimizer,
+    lr_scheduler: LambdaLR | None,
     epoch: int,
     args: argparse.Namespace,
     metrics: dict[str, Any],
@@ -329,6 +335,7 @@ def save_checkpoint(
         "epoch": epoch,
         "predictor_state_dict": model.predictor.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "lr_scheduler_state_dict": None if lr_scheduler is None else lr_scheduler.state_dict(),
         "args": args_to_jsonable_dict(args),
         "metrics": metrics,
         "state_columns": list(args.state_columns),
@@ -451,20 +458,21 @@ def main() -> None:
     start_epoch = 1
     global_step = 0
     resumed_from = None
+    resume_checkpoint: dict[str, Any] | None = None
     if args.resume_from is not None:
         resumed_from = args.resume_from
-        checkpoint = load_resume_checkpoint(
+        resume_checkpoint = load_resume_checkpoint(
             resume_path=args.resume_from,
             model=model,
             optimizer=optimizer,
             device=device,
         )
-        start_epoch = int(checkpoint["epoch"]) + 1
-        best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
-        best_epoch = int(checkpoint.get("best_epoch", 0))
-        global_step = int(checkpoint.get("global_step", 0))
-        epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", 0))
-        history = list(checkpoint.get("history", []))
+        start_epoch = int(resume_checkpoint["epoch"]) + 1
+        best_val_loss = float(resume_checkpoint.get("best_val_loss", best_val_loss))
+        best_epoch = int(resume_checkpoint.get("best_epoch", 0))
+        global_step = int(resume_checkpoint.get("global_step", 0))
+        epochs_without_improvement = int(resume_checkpoint.get("epochs_without_improvement", 0))
+        history = list(resume_checkpoint.get("history", []))
         print(
             json.dumps(
                 {
@@ -481,9 +489,20 @@ def main() -> None:
         )
         if start_epoch > args.epochs:
             raise ValueError(
-                f"Resume checkpoint already finished epoch {checkpoint['epoch']}, "
+                f"Resume checkpoint already finished epoch {resume_checkpoint['epoch']}, "
                 f"but --epochs={args.epochs}. Increase --epochs to continue."
             )
+    lr_scheduler = build_lr_scheduler(
+        optimizer=optimizer,
+        total_train_steps=total_train_steps,
+        warmup_steps=warmup_steps,
+        warmup_start_factor=args.warmup_start_factor,
+        min_lr_ratio=args.min_lr_ratio,
+        base_lr=args.lr,
+    )
+    if resume_checkpoint is not None and resume_checkpoint.get("lr_scheduler_state_dict") is not None:
+        lr_scheduler.load_state_dict(resume_checkpoint["lr_scheduler_state_dict"])
+    sync_lr_scheduler(lr_scheduler, global_step)
     wandb_run = init_wandb(args, config=run_config, job_type="train-rc-jepa-ac")
     watch_model(wandb_run, model.predictor, args)
 
@@ -496,6 +515,7 @@ def main() -> None:
                 dataloader=dataloaders["train"],
                 device=device,
                 optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
                 grad_clip=args.grad_clip,
                 label=f"epoch {epoch:03d}/{args.epochs:03d} train",
                 show_progress=not args.no_progress,
@@ -504,11 +524,6 @@ def main() -> None:
                 wandb_log_every=args.wandb_log_every,
                 epoch=epoch,
                 global_step_start=global_step,
-                base_lr=args.lr,
-                total_train_steps=total_train_steps,
-                warmup_steps=warmup_steps,
-                warmup_start_factor=args.warmup_start_factor,
-                min_lr_ratio=args.min_lr_ratio,
                 wandb_grad_stats_every=args.wandb_grad_stats_every,
                 wandb_param_stats_every=args.wandb_param_stats_every,
             )
@@ -519,6 +534,7 @@ def main() -> None:
                     dataloader=dataloaders["val"],
                     device=device,
                     optimizer=None,
+                    lr_scheduler=None,
                     grad_clip=args.grad_clip,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val",
                     show_progress=not args.no_progress,
@@ -555,6 +571,7 @@ def main() -> None:
                 args.output_dir / "last.pt",
                 model,
                 optimizer,
+                lr_scheduler,
                 epoch,
                 args,
                 epoch_metrics,
@@ -569,6 +586,7 @@ def main() -> None:
                 epochs_dir / f"epoch_{epoch:03d}.pt",
                 model,
                 optimizer,
+                lr_scheduler,
                 epoch,
                 args,
                 epoch_metrics,
@@ -584,6 +602,7 @@ def main() -> None:
                     args.output_dir / "best.pt",
                     model,
                     optimizer,
+                    lr_scheduler,
                     epoch,
                     args,
                     epoch_metrics,
@@ -638,6 +657,7 @@ def main() -> None:
                 dataloader=dataloaders["test"],
                 device=device,
                 optimizer=None,
+                lr_scheduler=None,
                 grad_clip=args.grad_clip,
                 label="test",
                 show_progress=not args.no_progress,

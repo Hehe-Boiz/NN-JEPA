@@ -11,6 +11,15 @@ const frameLabel = document.getElementById("frameLabel");
 const sessionLabel = document.getElementById("sessionLabel");
 const frameCount = document.getElementById("frameCount");
 const fileList = document.getElementById("fileList");
+const syncDriveButton = document.getElementById("syncDriveButton");
+const preprocessButton = document.getElementById("preprocessButton");
+const extractFeaturesButton = document.getElementById("extractFeaturesButton");
+const cancelJobButton = document.getElementById("cancelJobButton");
+const featureBatchInput = document.getElementById("featureBatchInput");
+const featureWorkersInput = document.getElementById("featureWorkersInput");
+const jobStatus = document.getElementById("jobStatus");
+const jobName = document.getElementById("jobName");
+const jobLog = document.getElementById("jobLog");
 
 const state = {
   source: "raw",
@@ -19,12 +28,29 @@ const state = {
   currentIndex: 0,
   playing: false,
   timerId: null,
+  jobTimerId: null,
+  lastJobStatus: null,
 };
 
 async function fetchJson(url) {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
+async function postJson(url, payload = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${text}`);
   }
   return response.json();
 }
@@ -190,4 +216,84 @@ function showError(error) {
   sessionLabel.textContent = `Error: ${error.message}`;
 }
 
+function setJobButtonsEnabled(running) {
+  syncDriveButton.disabled = running;
+  preprocessButton.disabled = running;
+  extractFeaturesButton.disabled = running;
+  cancelJobButton.disabled = !running;
+  featureBatchInput.disabled = running;
+  featureWorkersInput.disabled = running;
+}
+
+function renderJob(payload) {
+  const job = payload.job;
+  if (!job) {
+    jobStatus.textContent = "idle";
+    jobName.textContent = "No job";
+    jobLog.textContent = "No job has run yet.";
+    setJobButtonsEnabled(false);
+    return;
+  }
+
+  const running = job.status === "running";
+  jobStatus.textContent = job.status;
+  jobName.textContent = `${job.name} #${job.id}`;
+  jobLog.textContent = job.log.length > 0 ? job.log.join("\n") : "Waiting for output...";
+  jobLog.scrollTop = jobLog.scrollHeight;
+  setJobButtonsEnabled(running);
+
+  if (state.lastJobStatus === "running" && job.status === "completed" && (job.name === "sync" || job.name === "preprocess")) {
+    loadSessions().catch(showError);
+  }
+  state.lastJobStatus = job.status;
+}
+
+async function refreshJob() {
+  const payload = await fetchJson("/api/jobs");
+  renderJob(payload);
+}
+
+function ensureJobPolling() {
+  if (state.jobTimerId !== null) {
+    return;
+  }
+  state.jobTimerId = window.setInterval(() => {
+    refreshJob().catch((error) => {
+      console.error(error);
+      jobStatus.textContent = `error: ${error.message}`;
+    });
+  }, 1500);
+}
+
+async function startJob(job, payload = {}) {
+  const response = await postJson("/api/jobs/start", { job, ...payload });
+  renderJob(response);
+  ensureJobPolling();
+}
+
+syncDriveButton.addEventListener("click", () => {
+  startJob("sync").catch(showError);
+});
+
+preprocessButton.addEventListener("click", () => {
+  startJob("preprocess").catch(showError);
+});
+
+extractFeaturesButton.addEventListener("click", () => {
+  const batchSize = Math.max(1, Number.parseInt(featureBatchInput.value, 10) || 32);
+  const numWorkers = Math.max(0, Number.parseInt(featureWorkersInput.value, 10) || 0);
+  startJob("extract_features", {
+    batch_size: batchSize,
+    num_workers: numWorkers,
+  }).catch(showError);
+});
+
+cancelJobButton.addEventListener("click", () => {
+  postJson("/api/jobs/cancel")
+    .then(renderJob)
+    .catch(showError);
+});
+
 loadSessions().catch(showError);
+refreshJob().catch(showError);
+ensureJobPolling();

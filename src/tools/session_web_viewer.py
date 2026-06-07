@@ -5,6 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +24,11 @@ from data import settings
 VIEWER_ROOT = Path(__file__).resolve().parents[1] / "viewer"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = REPO_ROOT / "src"
+DEFAULT_VJEPA_CHECKPOINT = "checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt"
+DEFAULT_FEATURE_DIR = "data/processed/features/vjepa2_1_vitb_384_ema_fp32"
+MAX_JOB_LOG_LINES = 800
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,12 +131,177 @@ def read_static_file(name: str) -> bytes:
     return path.read_bytes()
 
 
+def build_sync_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "tools.sync_drive_data",
+        "--check-zips",
+    ]
+
+
+def build_preprocess_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "tools.preprocess_data",
+    ]
+
+
+def build_extract_feature_command(batch_size: int = 32, num_workers: int | None = None) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "tools.extract_vjepa_features",
+        "--vjepa-root",
+        "vjepa2",
+        "--vjepa-checkpoint",
+        DEFAULT_VJEPA_CHECKPOINT,
+        "--encoder",
+        "vit_base_384",
+        "--checkpoint-key",
+        "ema_encoder",
+        "--manifest-dir",
+        "data/processed/manifests",
+        "--output-dir",
+        DEFAULT_FEATURE_DIR,
+        "--batch-size",
+        str(batch_size),
+        "--dtype",
+        "fp32",
+    ]
+    if num_workers is not None:
+        command += ["--num-workers", str(num_workers)]
+    return command
+
+
+def build_job_command(job_name: str, payload: dict[str, Any] | None = None) -> list[str]:
+    payload = payload or {}
+    if job_name == "sync":
+        return build_sync_command()
+    if job_name == "preprocess":
+        return build_preprocess_command()
+    if job_name == "extract_features":
+        batch_size = int(payload.get("batch_size", 32))
+        num_workers_value = payload.get("num_workers")
+        num_workers = None if num_workers_value in (None, "") else int(num_workers_value)
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if num_workers is not None and num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
+        return build_extract_feature_command(batch_size=batch_size, num_workers=num_workers)
+    raise ValueError(f"Unsupported job: {job_name}")
+
+
+class JobRunner:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._job: dict[str, Any] | None = None
+        self._process: subprocess.Popen[str] | None = None
+        self._next_id = 1
+
+    def start(self, job_name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        command = build_job_command(job_name, payload)
+        with self._lock:
+            if self._job is not None and self._job["status"] == "running":
+                raise RuntimeError(f"Job already running: {self._job['name']}")
+            job_id = self._next_id
+            self._next_id += 1
+            self._job = {
+                "id": job_id,
+                "name": job_name,
+                "status": "running",
+                "command": command,
+                "started_at": time.time(),
+                "finished_at": None,
+                "exit_code": None,
+                "log": deque(maxlen=MAX_JOB_LOG_LINES),
+            }
+            self._append_log_locked(f"$ {' '.join(command)}")
+
+        thread = threading.Thread(target=self._run, args=(job_id, command), daemon=True)
+        thread.start()
+        return self.snapshot()
+
+    def cancel(self) -> dict[str, Any]:
+        with self._lock:
+            process = self._process
+            if self._job is None or self._job["status"] != "running" or process is None:
+                raise RuntimeError("No running job to cancel")
+            self._append_log_locked("Cancel requested.")
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process.terminate()
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            if self._job is None:
+                return {"job": None}
+            job = dict(self._job)
+            job["log"] = list(self._job["log"])
+            return {"job": job}
+
+    def _run(self, job_id: int, command: list[str]) -> None:
+        env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(SRC_ROOT) if not existing_pythonpath else str(SRC_ROOT) + os.pathsep + existing_pythonpath
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            with self._lock:
+                if self._job is not None and self._job["id"] == job_id:
+                    self._process = process
+            assert process.stdout is not None
+            for line in process.stdout:
+                with self._lock:
+                    if self._job is not None and self._job["id"] == job_id:
+                        self._append_log_locked(line.rstrip())
+            exit_code = process.wait()
+            with self._lock:
+                if self._job is not None and self._job["id"] == job_id:
+                    self._job["exit_code"] = exit_code
+                    self._job["finished_at"] = time.time()
+                    self._job["status"] = "completed" if exit_code == 0 else "failed"
+                    self._append_log_locked(f"Job finished with exit code {exit_code}.")
+                    self._process = None
+        except Exception as exc:  # pragma: no cover - defensive guard for server runtime.
+            with self._lock:
+                if self._job is not None and self._job["id"] == job_id:
+                    self._job["exit_code"] = None
+                    self._job["finished_at"] = time.time()
+                    self._job["status"] = "failed"
+                    self._append_log_locked(f"Job failed before process start: {exc}")
+                    self._process = None
+
+    def _append_log_locked(self, line: str) -> None:
+        if self._job is not None:
+            self._job["log"].append(line)
+
+
+JOB_RUNNER = JobRunner()
+
+
 class SessionViewerHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch(include_body=True)
 
     def do_HEAD(self) -> None:  # noqa: N802
         self._dispatch(include_body=False)
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._dispatch_post()
 
     def _dispatch(self, include_body: bool) -> None:
         parsed = urlparse(self.path)
@@ -152,12 +329,33 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
                 payload = build_session_payload(source=source, session_id=session_id)
                 self._send_json(payload, include_body)
                 return
+            if path == "/api/jobs":
+                self._send_json(JOB_RUNNER.snapshot(), include_body)
+                return
             if path.startswith("/media/"):
                 self._serve_media(path, include_body)
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except FileNotFoundError as exc:
             self.send_error(HTTPStatus.NOT_FOUND, str(exc))
+        except ValueError as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+
+    def _dispatch_post(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/jobs/start":
+                payload = self._read_json_body()
+                job_name = str(payload.get("job", ""))
+                self._send_json(JOB_RUNNER.start(job_name, payload), include_body=True)
+                return
+            if path == "/api/jobs/cancel":
+                self._send_json(JOB_RUNNER.cancel(), include_body=True)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+        except RuntimeError as exc:
+            self.send_error(HTTPStatus.CONFLICT, str(exc))
         except ValueError as exc:
             self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
@@ -182,6 +380,18 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict[str, Any], include_body: bool) -> None:
         data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self._send_bytes(data, "application/json; charset=utf-8", include_body)
+
+    def _read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
 
     def _send_bytes(self, data: bytes, content_type: str, include_body: bool) -> None:
         self.send_response(HTTPStatus.OK)

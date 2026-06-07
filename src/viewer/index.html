@@ -26,6 +26,28 @@
           <div><strong>Frames:</strong> <span id="frameCount">-</span></div>
           <div><strong>Files:</strong> <span id="fileList">-</span></div>
         </div>
+
+        <section class="ops-panel">
+          <h2>Data Ops</h2>
+          <button id="syncDriveButton" type="button">Sync Drive</button>
+          <button id="preprocessButton" type="button">Preprocess</button>
+          <div class="extract-grid">
+            <label>
+              Feature batch
+              <input id="featureBatchInput" type="number" min="1" max="128" value="32" />
+            </label>
+            <label>
+              Workers
+              <input id="featureWorkersInput" type="number" min="0" max="32" value="4" />
+            </label>
+          </div>
+          <button id="extractFeaturesButton" type="button">Extract V-JEPA Features</button>
+          <button id="cancelJobButton" class="secondary" type="button">Cancel Running Job</button>
+          <div class="job-status">
+            <strong>Status:</strong> <span id="jobStatus">idle</span>
+          </div>
+        </section>
+
         <p class="hint">
           Keyboard: <code>Space</code> play/pause, <code>Left</code>/<code>Right</code> step frame.
         </p>
@@ -56,6 +78,14 @@
             <span id="sessionLabel">No session loaded</span>
           </div>
         </div>
+
+        <section class="job-log-panel">
+          <div class="job-log-header">
+            <h2>Job Log</h2>
+            <span id="jobName">No job</span>
+          </div>
+          <pre id="jobLog">No job has run yet.</pre>
+        </section>
       </main>
     </div>
 

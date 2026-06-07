@@ -18,7 +18,7 @@ DEFAULT_WIDTH = 640
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export one session into a preview GIF.")
-    parser.add_argument("--session-id", required=True, help="Example: session_20260605_150919")
+    parser.add_argument("--session-id", required=True, help="Example: session_20260607_111842")
     parser.add_argument(
         "--source",
         choices=["raw", "processed"],
