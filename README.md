@@ -118,7 +118,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac \
   --output-dir checkpoints/rc_jepa_ac \
   --epochs 100 \
   --batch-size 10 \
-  --eval-batch-size 8 \
+  --eval-batch-size 2 \
   --lr 1e-4 \
   --warmup-epochs 4 \
   --warmup-start-factor 0.1 \
@@ -203,7 +203,7 @@ Train NN-JEPA hiện tại:
 ```text
 epochs = 100
 batch_size = 10
-eval_batch_size = 8
+eval_batch_size = 2
 num_workers = 4
 optimizer = AdamW
 lr = 1e-4
@@ -398,7 +398,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --output-dir checkpoints/rc_jepa_ac_vitb_features \
   --epochs 100 \
   --batch-size 10 \
-  --eval-batch-size 8 \
+  --eval-batch-size 2 \
   --lr 1e-4 \
   --warmup-epochs 4 \
   --warmup-start-factor 0.1 \
@@ -415,7 +415,7 @@ Cấu hình trên giữ:
 
 - `fp32` latent cache để tránh giảm precision do lưu feature.
 - full patch token `576 token/frame`, không pooling, không giảm token.
-- `train batch_size = 10`, `val/test batch_size = 8`, predictor mặc định `20.01M params`.
+- `train batch_size = 10`, `val/test batch_size = 2`, predictor mặc định `20.01M params`.
 - W&B log đầy đủ loss, gradient, parameter histogram và gradient scalar stats.
 - mặc định script hiện dùng `num_workers = 4`, `prefetch_factor = 4`
 
@@ -435,7 +435,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --output-dir checkpoints/rc_jepa_ac_vitb_features \
   --epochs 100 \
   --batch-size 10 \
-  --eval-batch-size 8 \
+  --eval-batch-size 2 \
   --num-workers 8 \
   --lr 1e-4 \
   --warmup-epochs 4 \
@@ -452,7 +452,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
 Điểm chính của lệnh trên:
 
 - vẫn giữ `fp32`, full token `576 token/frame`, predictor mặc định `20.01M params`
-- không giảm `train batch_size`, chỉ giảm `val/test` xuống `8` cho an toàn hơn
+- không giảm `train batch_size`, chỉ giảm `val/test` xuống `2` cho an toàn hơn
 - chỉ giảm tải W&B và thêm `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` để giảm rủi ro phân mảnh VRAM
 
 Resume train từ feature cache:
@@ -465,7 +465,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --resume-from checkpoints/rc_jepa_ac_vitb_features/last.pt \
   --epochs 100 \
   --batch-size 10 \
-  --eval-batch-size 8 \
+  --eval-batch-size 2 \
   --lr 1e-4
 ```
 
@@ -484,11 +484,62 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --resume-from checkpoints/rc_jepa_ac_vitb_features/last_train.pt \
   --epochs 100 \
   --batch-size 10 \
-  --eval-batch-size 8 \
+  --eval-batch-size 2 \
   --lr 1e-4
 ```
 
 Script sẽ nhận ra checkpoint đang ở pha `train_complete_waiting_val` và đi tiếp vào `val` của đúng epoch đó, không train lại epoch vừa xong.
+
+Chạy standalone eval/test từ checkpoint:
+
+```bash
+PYTHONPATH=src python3 -m tools.eval_rc_jepa_ac_features \
+  --checkpoint checkpoints/rc_jepa_ac_vitb_features/best.pt \
+  --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --manifest-dir data/processed/manifests \
+  --split test \
+  --eval-batch-size 2 \
+  --num-workers 8
+```
+
+Kết quả sẽ được ghi vào:
+
+```text
+checkpoints/rc_jepa_ac_vitb_features/eval_test.json
+```
+
+Nếu muốn eval cả `train`, `val`, `test`:
+
+```bash
+--split all
+```
+
+Chạy inference từ checkpoint:
+
+```bash
+PYTHONPATH=src python3 -m tools.infer_rc_jepa_ac_features \
+  --checkpoint checkpoints/rc_jepa_ac_vitb_features/best.pt \
+  --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --manifest-dir data/processed/manifests \
+  --split test \
+  --max-samples 32 \
+  --eval-batch-size 2 \
+  --num-workers 8
+```
+
+Inference mặc định ghi metric gọn theo sample vào:
+
+```text
+checkpoints/rc_jepa_ac_vitb_features/inference/inference_test.jsonl
+```
+
+Nếu muốn lưu cả tensor latent dự đoán và target cho từng sample, thêm:
+
+```bash
+--save-tensors
+```
+
+Lưu ý: inference hiện tại là inference của **world model latent**, tức là dự đoán latent frame tương lai từ latent hiện tại + state + action. Nó không sinh trực tiếp `steering_cmd_t`/`throttle_cmd_t`.
 
 Lưu ý khi dùng feature cache:
 
@@ -614,6 +665,9 @@ src/tools/train_rc_car.py
 src/tools/train_rc_jepa_ac.py
 src/tools/extract_vjepa_features.py
 src/tools/train_rc_jepa_ac_features.py
+src/tools/eval_rc_jepa_ac_features.py
+src/tools/infer_rc_jepa_ac_features.py
+src/tools/rc_jepa_ac_feature_runtime.py
 ```
 
 ## Chỗ chỉnh nhanh nhất

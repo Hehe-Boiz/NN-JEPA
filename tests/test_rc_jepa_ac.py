@@ -18,6 +18,7 @@ if TORCH_AVAILABLE:
     from data.feature_sequence_dataset import RCJepaACFeatureSequenceDataset
     from data.sequence_dataset import RCJepaACSequenceDataset, build_sequence_windows
     from models.rc_jepa_ac import SimpleACPredictor, build_rollout_state_context, compute_world_model_losses
+    from tools.rc_jepa_ac_feature_runtime import config_from_checkpoint
     from tools.train_rc_jepa_ac import compute_lr_scale, compute_warmup_steps, should_apply_early_stopping
 
 
@@ -250,6 +251,40 @@ class RCJepaACTests(unittest.TestCase):
     def test_early_stopping_starts_after_warmup(self) -> None:
         self.assertFalse(should_apply_early_stopping(epoch=1, warmup_epochs=1))
         self.assertTrue(should_apply_early_stopping(epoch=2, warmup_epochs=1))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_feature_checkpoint_config_reads_model_shape(self) -> None:
+        checkpoint = {
+            "args": {
+                "state_columns": ["yaw_rate_t", "accel_x_t"],
+                "action_columns": ["steering_cmd_t", "throttle_cmd_t"],
+                "raw_frames_per_sample": 6,
+                "sequence_stride": 2,
+                "auto_steps": 3,
+                "predictor_dim": 32,
+                "predictor_depth": 2,
+                "predictor_heads": 4,
+                "dropout": 0.1,
+            },
+            "feature_metadata": {
+                "tokens_per_frame": 4,
+                "embed_dim": 8,
+                "dtype": "fp32",
+            },
+        }
+
+        config = config_from_checkpoint(checkpoint)
+
+        self.assertEqual(config.state_columns, ("yaw_rate_t", "accel_x_t"))
+        self.assertEqual(config.action_columns, ("steering_cmd_t", "throttle_cmd_t"))
+        self.assertEqual(config.raw_frames_per_sample, 6)
+        self.assertEqual(config.sequence_stride, 2)
+        self.assertEqual(config.auto_steps, 3)
+        self.assertEqual(config.predictor_dim, 32)
+        self.assertEqual(config.predictor_depth, 2)
+        self.assertEqual(config.predictor_heads, 4)
+        self.assertEqual(config.tokens_per_frame, 4)
+        self.assertEqual(config.embed_dim, 8)
 
 
 def make_manifest_sample(session_id: str, frame_index: int, image_path: Path) -> dict[str, object]:

@@ -214,7 +214,7 @@ RANDOM_SEED = 42
 # Dataloader
 # ---------------------------------------------------------------------------
 BATCH_SIZE = 32
-AC_EVAL_BATCH_SIZE = 8
+AC_EVAL_BATCH_SIZE = 2
 NUM_WORKERS = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
