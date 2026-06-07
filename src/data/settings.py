@@ -13,10 +13,10 @@ from pathlib import Path
 # Project paths
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
-JEPA_ROOT = REPO_ROOT / "JEPA"
+DATA_ROOT = REPO_ROOT / "data"
 
-RAW_DATA_DIR = JEPA_ROOT / "data" / "raw"
-PROCESSED_DATA_DIR = JEPA_ROOT / "data" / "processed"
+RAW_DATA_DIR = DATA_ROOT / "raw"
+PROCESSED_DATA_DIR = DATA_ROOT / "processed"
 PROCESSED_IMAGE_DIR = PROCESSED_DATA_DIR / "images"
 MANIFEST_DIR = PROCESSED_DATA_DIR / "manifests"
 REPORT_DIR = PROCESSED_DATA_DIR / "reports"
@@ -25,7 +25,7 @@ REPORT_DIR = PROCESSED_DATA_DIR / "reports"
 # ---------------------------------------------------------------------------
 # Session structure
 # Current PRIMARY layout after JEPA onboard Android update:
-#   JEPA/data/raw/session_xxx/
+#   data/raw/session_xxx/
 #     frames/
 #     actions.csv
 #     telemetry.csv
@@ -89,6 +89,8 @@ AC_SEQUENCE_STRIDE = 1
 AC_IMAGE_SIZE = 384
 AC_TUBELET_SIZE = 2
 AC_AUTO_STEPS = 2
+AC_MAX_FRAME_INDEX_GAP = 1
+AC_MAX_TIME_GAP_SEC = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +157,7 @@ DROP_DUPLICATE_FRAME_INDEX = True
 DROP_ROWS_WITH_MISSING_FRAME = True
 DROP_ROWS_WITH_MISSING_ACTION = True
 DROP_ROWS_OUTSIDE_ACTION_RANGE = True
-REMOVE_SIMPLE_OUTLIERS = False
+REMOVE_SIMPLE_OUTLIERS = True
 OUTLIER_STD_FACTOR = 4.0
 OUTLIER_COLUMNS = ("v_t", "yaw_rate_t", "accel_x_t", "accel_y_t")
 
@@ -172,6 +174,17 @@ THROTTLE_MAX = 1.0
 # ---------------------------------------------------------------------------
 STEERING_SCALE = 1.0
 THROTTLE_SCALE = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Numeric input normalization
+# Image tensors use ImageNet normalization. These flags control small numeric
+# vectors. Stats are computed from the train manifest only at DataLoader setup.
+# ---------------------------------------------------------------------------
+NORMALIZE_STATE_INPUTS = True
+NORMALIZE_AC_ACTION_INPUTS = True
+NUMERIC_NORMALIZE_EPS = 1e-6
+NUMERIC_NORMALIZE_CLIP = 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +214,11 @@ RANDOM_SEED = 42
 # Dataloader
 # ---------------------------------------------------------------------------
 BATCH_SIZE = 32
+AC_EVAL_BATCH_SIZE = 8
 NUM_WORKERS = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 4
 SHUFFLE_TRAIN = True
 
 

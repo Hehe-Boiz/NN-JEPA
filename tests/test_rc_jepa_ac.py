@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
 from PIL import Image
 
 import data.settings as settings
@@ -14,8 +15,10 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 if TORCH_AVAILABLE:
     import torch
 
-    from data.sequence_dataset import RCJepaACSequenceDataset
-    from models.rc_jepa_ac import SimpleACPredictor, compute_world_model_losses
+    from data.feature_sequence_dataset import RCJepaACFeatureSequenceDataset
+    from data.sequence_dataset import RCJepaACSequenceDataset, build_sequence_windows
+    from models.rc_jepa_ac import SimpleACPredictor, build_rollout_state_context, compute_world_model_losses
+    from tools.train_rc_jepa_ac import compute_lr_scale, compute_warmup_steps, should_apply_early_stopping
 
 
 class RCJepaACTests(unittest.TestCase):
@@ -52,6 +55,74 @@ class RCJepaACTests(unittest.TestCase):
             self.assertEqual(item["session_id"], "session_a")
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_feature_sequence_dataset_reads_cached_frame_features(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = root / "train.jsonl"
+            features_dir = root / "features"
+            sessions_dir = features_dir / "sessions"
+            sessions_dir.mkdir(parents=True)
+
+            samples = []
+            for session_id in ("session_a", "session_b"):
+                feature_array = np.zeros((5, 4, 8), dtype=np.float16)
+                frames = []
+                for frame_index in range(5):
+                    image_path = root / f"{session_id}_{frame_index}.jpg"
+                    Image.new("RGB", (8, 8), color=(frame_index * 20, 0, 0)).save(image_path)
+                    samples.append(make_manifest_sample(session_id, frame_index, image_path))
+                    feature_array[frame_index] = float(frame_index)
+                    frames.append(
+                        {
+                            "row": frame_index,
+                            "sample_id": f"{session_id}_{frame_index:06d}",
+                            "session_id": session_id,
+                            "frame_index": frame_index,
+                            "timestamp_sec": float(frame_index) * 0.1,
+                        }
+                    )
+
+                np.save(sessions_dir / f"{session_id}.npy", feature_array)
+                (sessions_dir / f"{session_id}.json").write_text(
+                    json.dumps({"session_id": session_id, "frames": frames}),
+                    encoding="utf-8",
+                )
+
+            (features_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "tokens_per_frame": 4,
+                        "embed_dim": 8,
+                        "dtype": "fp16",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                "".join(json.dumps(sample) + "\n" for sample in samples),
+                encoding="utf-8",
+            )
+
+            dataset = RCJepaACFeatureSequenceDataset(
+                split="train",
+                features_dir=features_dir,
+                manifest_path=manifest_path,
+                raw_frames_per_sample=4,
+                sequence_stride=1,
+            )
+
+            self.assertEqual(len(dataset), 4)
+            item = dataset[0]
+            self.assertEqual(tuple(item["latents"].shape), (16, 8))
+            self.assertEqual(item["latents"].dtype, torch.float32)
+            self.assertEqual(tuple(item["states"].shape), (4, len(settings.AC_STATE_COLUMNS)))
+            self.assertEqual(tuple(item["actions"].shape), (3, len(settings.AC_ACTION_COLUMNS)))
+            self.assertEqual(item["session_id"], "session_a")
+            self.assertAlmostEqual(float(item["latents"][0, 0]), 0.0)
+            self.assertAlmostEqual(float(item["latents"][-1, 0]), 3.0)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_ac_predictor_keeps_latent_shape(self) -> None:
         predictor = SimpleACPredictor(
             latent_dim=8,
@@ -70,6 +141,50 @@ class RCJepaACTests(unittest.TestCase):
         prediction = predictor(latents, actions, states)
 
         self.assertEqual(tuple(prediction.shape), (2, 3 * 4, 8))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_sequence_windows_do_not_cross_frame_gap(self) -> None:
+        samples = [
+            make_manifest_sample("session_a", 0, Path("0.jpg")),
+            make_manifest_sample("session_a", 1, Path("1.jpg")),
+            make_manifest_sample("session_a", 2, Path("2.jpg")),
+            make_manifest_sample("session_a", 10, Path("10.jpg")),
+            make_manifest_sample("session_a", 11, Path("11.jpg")),
+        ]
+        for sample, timestamp in zip(samples, [0.0, 0.1, 0.2, 1.0, 1.1]):
+            sample["timestamp_sec"] = timestamp
+
+        windows = build_sequence_windows(
+            samples,
+            raw_frames_per_sample=3,
+            sequence_stride=1,
+            state_columns=settings.AC_STATE_COLUMNS,
+            action_columns=settings.AC_ACTION_COLUMNS,
+            max_frame_index_gap=1,
+            max_time_gap_sec=0.25,
+        )
+
+        self.assertEqual(windows, [[0, 1, 2]])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_rollout_state_context_does_not_use_future_measured_state(self) -> None:
+        initial_state = torch.tensor([[[10.0, 20.0, 30.0, 0.1, 0.2]]])
+        actions = torch.tensor([[[0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]])
+
+        rollout_states = build_rollout_state_context(
+            initial_state=initial_state,
+            actions=actions,
+            rollout_steps=3,
+            state_columns=tuple(settings.AC_STATE_COLUMNS),
+            action_columns=tuple(settings.AC_ACTION_COLUMNS),
+        )
+
+        self.assertEqual(tuple(rollout_states.shape), (1, 3, 5))
+        self.assertAlmostEqual(float(rollout_states[0, 1, 0]), 10.0)
+        self.assertAlmostEqual(float(rollout_states[0, 1, 1]), 20.0)
+        self.assertAlmostEqual(float(rollout_states[0, 1, 2]), 30.0)
+        self.assertAlmostEqual(float(rollout_states[0, 1, 3]), 0.3)
+        self.assertAlmostEqual(float(rollout_states[0, 1, 4]), 0.4)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_world_model_losses_are_scalar(self) -> None:
@@ -100,13 +215,49 @@ class RCJepaACTests(unittest.TestCase):
         self.assertEqual(outputs["teacher_forcing_loss"].ndim, 0)
         self.assertEqual(outputs["rollout_loss"].ndim, 0)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_lr_schedule_uses_warmup_then_cosine_decay(self) -> None:
+        warmup_steps = compute_warmup_steps(warmup_epochs=2, steps_per_epoch=3, total_train_steps=12)
+        self.assertEqual(warmup_steps, 6)
+
+        start_scale = compute_lr_scale(
+            step=0,
+            total_train_steps=12,
+            warmup_steps=warmup_steps,
+            warmup_start_factor=0.1,
+            min_lr_ratio=0.1,
+        )
+        warmup_end_scale = compute_lr_scale(
+            step=warmup_steps,
+            total_train_steps=12,
+            warmup_steps=warmup_steps,
+            warmup_start_factor=0.1,
+            min_lr_ratio=0.1,
+        )
+        final_scale = compute_lr_scale(
+            step=12,
+            total_train_steps=12,
+            warmup_steps=warmup_steps,
+            warmup_start_factor=0.1,
+            min_lr_ratio=0.1,
+        )
+
+        self.assertAlmostEqual(start_scale, 0.1)
+        self.assertAlmostEqual(warmup_end_scale, 1.0)
+        self.assertAlmostEqual(final_scale, 0.1)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_early_stopping_starts_after_warmup(self) -> None:
+        self.assertFalse(should_apply_early_stopping(epoch=1, warmup_epochs=1))
+        self.assertTrue(should_apply_early_stopping(epoch=2, warmup_epochs=1))
+
 
 def make_manifest_sample(session_id: str, frame_index: int, image_path: Path) -> dict[str, object]:
     return {
         "sample_id": f"{session_id}_{frame_index:06d}",
         "session_id": session_id,
         "frame_index": frame_index,
-        "timestamp_sec": float(frame_index),
+        "timestamp_sec": float(frame_index) * 0.1,
         "frame_path": str(image_path),
         "state": {
             "v_t": 0.0,

@@ -459,6 +459,8 @@ def keep_meta_fields(
             meta[key] = value
 
     for stream_name, stream_row in sensor_rows.items():
+        if stream_row is None:
+            continue
         t_ms = read_timestamp_ms(stream_row)
         if t_ms is None:
             continue
@@ -493,14 +495,16 @@ def remove_simple_outliers(samples: list[dict[str, Any]]) -> tuple[list[dict[str
         values = [sample["state"][column] for sample in samples]
         if not values:
             continue
-        mean = sum(values) / len(values)
-        variance = sum((value - mean) ** 2 for value in values) / len(values)
-        std = math.sqrt(variance)
-        if math.isclose(std, 0.0):
+        center = median(values)
+        deviations = [abs(value - center) for value in values]
+        robust_std = 1.4826 * median(deviations)
+        if math.isclose(robust_std, 0.0):
+            robust_std = compute_std(values)
+        if math.isclose(robust_std, 0.0):
             continue
         limits[column] = (
-            mean - settings.OUTLIER_STD_FACTOR * std,
-            mean + settings.OUTLIER_STD_FACTOR * std,
+            center - settings.OUTLIER_STD_FACTOR * robust_std,
+            center + settings.OUTLIER_STD_FACTOR * robust_std,
         )
 
     kept: list[dict[str, Any]] = []
@@ -517,6 +521,14 @@ def remove_simple_outliers(samples: list[dict[str, Any]]) -> tuple[list[dict[str
         else:
             dropped += 1
     return kept, dropped
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
 def build_session_split(session_ids: list[str]) -> dict[str, str]:

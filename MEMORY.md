@@ -24,7 +24,7 @@ train action-conditioned predictor/world model trên dữ liệu xe RC
 Raw data dự kiến nằm trong:
 
 ```text
-JEPA/data/raw/session_xxx/
+data/raw/session_xxx/
   frames/
   actions.csv
   telemetry.csv
@@ -51,7 +51,7 @@ JEPA/data/raw/session_xxx/
 Processed data nằm trong:
 
 ```text
-JEPA/data/processed/
+data/processed/
   images/
   manifests/train.jsonl
   manifests/val.jsonl
@@ -377,7 +377,7 @@ Ví dụ:
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac \
   --vjepa-checkpoint /path/to/vjepa2_1_checkpoint.pt \
   --vjepa-root vjepa2 \
-  --manifest-dir JEPA/data/processed/manifests \
+  --manifest-dir data/processed/manifests \
   --output-dir checkpoints/rc_jepa_ac
 ```
 
@@ -423,6 +423,71 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 Kết quả pass.
 
 Lưu ý: tại thời điểm chạy test, môi trường shell chưa có `torch`, nên các test tensor/model bị skip. Code mới vẫn import torch trực tiếp, không có fallback import.
+
+## Cập nhật ổn định train mới nhất
+
+Đã sửa 3 vấn đề logic quan trọng:
+
+- Rollout trong `src/models/rc_jepa_ac.py` không còn dùng state tương lai thật. Nó chỉ dùng state ban đầu và action đã biết; riêng `steering_last_t` / `throttle_last_t` được cập nhật từ action trước đó.
+- Sequence dataset trong `src/data/sequence_dataset.py` không tạo window nếu frame hoặc timestamp bị đứt quãng.
+- Numeric input được normalize bằng thống kê từ train manifest, và checkpoint train lưu lại metadata normalization.
+
+Các biến global mới/cần nhớ trong `src/data/settings.py`:
+
+```python
+REMOVE_SIMPLE_OUTLIERS = True
+AC_MAX_FRAME_INDEX_GAP = 1
+AC_MAX_TIME_GAP_SEC = 0.25
+NORMALIZE_STATE_INPUTS = True
+NORMALIZE_AC_ACTION_INPUTS = True
+NUMERIC_NORMALIZE_CLIP = 8.0
+```
+
+Preprocess gần nhất đã rebuild manifest với outlier robust:
+
+```text
+train: 29195 samples
+val:    6484 samples
+test:   13579 samples
+```
+
+Report mới:
+
+```text
+data/processed/reports/preprocess_report.json
+```
+
+## W&B logging
+
+`tools.train_rc_car` và `tools.train_rc_jepa_ac` log lên Weights & Biases mặc định.
+
+Default project:
+
+```text
+nn-jepa-rc
+```
+
+Metrics:
+
+```text
+train/*
+val/*
+test/*
+best/val_loss
+lr
+```
+
+Tắt W&B:
+
+```bash
+--no-wandb
+```
+
+Log offline:
+
+```bash
+--wandb-mode offline
+```
 
 ## Quy tắc quan trọng cho các session sau
 

@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from . import settings
 from .dataset import HORIZONTAL_FLIP_SIGN_COLUMNS, image_to_tensor, load_manifest, normalize_tensor
+from .normalization import FeatureNormalizer, build_feature_normalizer
 
 
 DEFAULT_AC_STATE_COLUMNS = tuple(settings.AC_STATE_COLUMNS)
@@ -75,6 +76,10 @@ class RCJepaACSequenceDataset(Dataset):
         state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
         action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
         augment: bool | None = None,
+        state_normalizer: FeatureNormalizer | None = None,
+        action_normalizer: FeatureNormalizer | None = None,
+        max_frame_index_gap: int = settings.AC_MAX_FRAME_INDEX_GAP,
+        max_time_gap_sec: float = settings.AC_MAX_TIME_GAP_SEC,
     ) -> None:
         if raw_frames_per_sample < 2:
             raise ValueError("raw_frames_per_sample must be >= 2")
@@ -87,6 +92,10 @@ class RCJepaACSequenceDataset(Dataset):
         self.sequence_stride = sequence_stride
         self.state_columns = tuple(state_columns)
         self.action_columns = tuple(action_columns)
+        self.state_normalizer = state_normalizer
+        self.action_normalizer = action_normalizer
+        self.max_frame_index_gap = max_frame_index_gap
+        self.max_time_gap_sec = max_time_gap_sec
         self.samples = load_manifest(self.manifest_path)
         self.windows = build_sequence_windows(
             self.samples,
@@ -94,6 +103,8 @@ class RCJepaACSequenceDataset(Dataset):
             sequence_stride=self.sequence_stride,
             state_columns=self.state_columns,
             action_columns=self.action_columns,
+            max_frame_index_gap=self.max_frame_index_gap,
+            max_time_gap_sec=self.max_time_gap_sec,
         )
         use_augment = split == "train" if augment is None else augment
         self.augmentor = SequenceAugmentor() if use_augment else None
@@ -124,14 +135,18 @@ class RCJepaACSequenceDataset(Dataset):
             for image in images
         ]
         images_tensor = torch.stack(image_tensors, dim=1).contiguous()
-        states_tensor = torch.tensor(
-            [[state[column] for column in self.state_columns] for state in states],
-            dtype=torch.float32,
-        )
-        actions_tensor = torch.tensor(
-            [[action[column] for column in self.action_columns] for action in actions],
-            dtype=torch.float32,
-        )
+        if self.state_normalizer is None:
+            state_values = [[state[column] for column in self.state_columns] for state in states]
+        else:
+            state_values = [self.state_normalizer.normalize_row(state, self.state_columns) for state in states]
+
+        if self.action_normalizer is None:
+            action_values = [[action[column] for column in self.action_columns] for action in actions]
+        else:
+            action_values = [self.action_normalizer.normalize_row(action, self.action_columns) for action in actions]
+
+        states_tensor = torch.tensor(state_values, dtype=torch.float32)
+        actions_tensor = torch.tensor(action_values, dtype=torch.float32)
 
         first_sample = sequence[0]
         last_sample = sequence[-1]
@@ -155,6 +170,8 @@ def build_sequence_windows(
     sequence_stride: int,
     state_columns: Sequence[str],
     action_columns: Sequence[str],
+    max_frame_index_gap: int = settings.AC_MAX_FRAME_INDEX_GAP,
+    max_time_gap_sec: float = settings.AC_MAX_TIME_GAP_SEC,
 ) -> list[list[int]]:
     session_to_indices: dict[str, list[int]] = defaultdict(list)
     for sample_index, sample in enumerate(samples):
@@ -168,7 +185,14 @@ def build_sequence_windows(
             continue
         last_start = len(indices) - raw_frames_per_sample
         for start in range(0, last_start + 1, sequence_stride):
-            windows.append(indices[start : start + raw_frames_per_sample])
+            window = indices[start : start + raw_frames_per_sample]
+            if is_contiguous_window(
+                samples,
+                window,
+                max_frame_index_gap=max_frame_index_gap,
+                max_time_gap_sec=max_time_gap_sec,
+            ):
+                windows.append(window)
     return windows
 
 
@@ -191,6 +215,30 @@ def sample_sort_key(sample: dict[str, Any]) -> tuple[float, int]:
     return timestamp, int(sample["frame_index"])
 
 
+def is_contiguous_window(
+    samples: list[dict[str, Any]],
+    window: Sequence[int],
+    max_frame_index_gap: int,
+    max_time_gap_sec: float,
+) -> bool:
+    for left_index, right_index in zip(window, window[1:]):
+        left = samples[left_index]
+        right = samples[right_index]
+        frame_gap = int(right["frame_index"]) - int(left["frame_index"])
+        if max_frame_index_gap > 0 and frame_gap < 1:
+            return False
+        if max_frame_index_gap > 0 and frame_gap > max_frame_index_gap:
+            return False
+
+        left_t = timestamp_to_float(left.get("timestamp_sec"))
+        right_t = timestamp_to_float(right.get("timestamp_sec"))
+        if max_time_gap_sec > 0 and left_t == left_t and right_t == right_t:
+            time_gap = right_t - left_t
+            if time_gap <= 0 or time_gap > max_time_gap_sec:
+                return False
+    return True
+
+
 def timestamp_to_float(value: Any) -> float:
     if value is None:
         return float("nan")
@@ -202,6 +250,7 @@ def timestamp_to_float(value: Any) -> float:
 
 def create_ac_sequence_dataloaders(
     batch_size: int | None = None,
+    eval_batch_size: int | None = None,
     num_workers: int | None = None,
     manifest_dir: str | Path | None = None,
     raw_frames_per_sample: int = settings.AC_RAW_FRAMES_PER_SAMPLE,
@@ -210,8 +259,27 @@ def create_ac_sequence_dataloaders(
     action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
 ) -> dict[str, DataLoader]:
     batch_size = batch_size or settings.BATCH_SIZE
+    eval_batch_size = eval_batch_size or settings.AC_EVAL_BATCH_SIZE
     num_workers = settings.NUM_WORKERS if num_workers is None else num_workers
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": settings.PIN_MEMORY,
+        "persistent_workers": settings.PERSISTENT_WORKERS and num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = settings.PREFETCH_FACTOR
     manifest_root = Path(manifest_dir or settings.MANIFEST_DIR)
+    train_samples = load_manifest(manifest_root / "train.jsonl")
+    state_normalizer = (
+        build_feature_normalizer(train_samples, state_columns, source_key="state")
+        if settings.NORMALIZE_STATE_INPUTS
+        else None
+    )
+    action_normalizer = (
+        build_ac_action_normalizer(train_samples, action_columns, state_normalizer)
+        if settings.NORMALIZE_AC_ACTION_INPUTS
+        else None
+    )
 
     datasets = {
         split: RCJepaACSequenceDataset(
@@ -221,6 +289,8 @@ def create_ac_sequence_dataloaders(
             sequence_stride=sequence_stride,
             state_columns=state_columns,
             action_columns=action_columns,
+            state_normalizer=state_normalizer,
+            action_normalizer=action_normalizer,
         )
         for split in ("train", "val", "test")
     }
@@ -230,24 +300,38 @@ def create_ac_sequence_dataloaders(
             datasets["train"],
             batch_size=batch_size,
             shuffle=settings.SHUFFLE_TRAIN,
-            num_workers=num_workers,
-            pin_memory=settings.PIN_MEMORY,
-            persistent_workers=settings.PERSISTENT_WORKERS and num_workers > 0,
+            **loader_kwargs,
         ),
         "val": DataLoader(
             datasets["val"],
-            batch_size=batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=settings.PIN_MEMORY,
-            persistent_workers=settings.PERSISTENT_WORKERS and num_workers > 0,
+            **loader_kwargs,
         ),
         "test": DataLoader(
             datasets["test"],
-            batch_size=batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=settings.PIN_MEMORY,
-            persistent_workers=settings.PERSISTENT_WORKERS and num_workers > 0,
+            **loader_kwargs,
         ),
     }
+
+
+def build_ac_action_normalizer(
+    train_samples: list[dict[str, Any]],
+    action_columns: Sequence[str],
+    state_normalizer: FeatureNormalizer | None,
+) -> FeatureNormalizer:
+    action_normalizer = build_feature_normalizer(train_samples, action_columns, source_key="action")
+    if state_normalizer is None:
+        return action_normalizer
+
+    stats = dict(action_normalizer.stats)
+    control_state_map = {
+        "steering_cmd_t": "steering_last_t",
+        "throttle_cmd_t": "throttle_last_t",
+    }
+    for action_column, state_column in control_state_map.items():
+        if action_column in stats and state_column in state_normalizer.stats:
+            stats[action_column] = state_normalizer.stats[state_column]
+    return FeatureNormalizer(stats, clip_value=action_normalizer.clip_value)

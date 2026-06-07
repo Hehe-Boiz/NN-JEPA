@@ -1,10 +1,9 @@
-"""Train RC JEPA-AC world model with a frozen V-JEPA 2.1 encoder."""
+"""Train RC JEPA-AC predictor from precomputed V-JEPA 2.1 features."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 from pathlib import Path
 from typing import Any
@@ -15,17 +14,33 @@ from torch.optim import AdamW
 from tqdm.auto import tqdm
 
 from data import settings
-from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS, create_ac_sequence_dataloaders
+from data.feature_sequence_dataset import create_ac_feature_sequence_dataloaders
 from data.normalization import normalizer_to_dict
+from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS
 from models.rc_jepa_ac import (
-    DEFAULT_CHECKPOINT_KEY,
-    DEFAULT_ENCODER_NAME,
-    DEFAULT_PATCH_SIZE,
     DEFAULT_PREDICTOR_DEPTH,
     DEFAULT_PREDICTOR_DIM,
     DEFAULT_PREDICTOR_HEADS,
-    RCJepaACWorldModel,
+    SimpleACPredictor,
+    compute_world_model_losses,
     count_trainable_parameters,
+)
+from tools.train_rc_jepa_ac import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_EVAL_BATCH_SIZE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_EPOCHS,
+    DEFAULT_GRAD_CLIP,
+    DEFAULT_LR,
+    DEFAULT_MIN_LR_RATIO,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_WARMUP_EPOCHS,
+    DEFAULT_WARMUP_START_FACTOR,
+    DEFAULT_WEIGHT_DECAY,
+    apply_learning_rate,
+    compute_steps_per_epoch,
+    compute_warmup_steps,
+    should_apply_early_stopping,
 )
 from tools.wandb_utils import (
     add_wandb_args,
@@ -40,35 +55,18 @@ from tools.wandb_utils import (
 )
 
 
-DEFAULT_EPOCHS = 100
-DEFAULT_BATCH_SIZE = 10
-DEFAULT_EVAL_BATCH_SIZE = settings.AC_EVAL_BATCH_SIZE
-DEFAULT_NUM_WORKERS = settings.NUM_WORKERS
-DEFAULT_LR = 1e-4
-DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_GRAD_CLIP = 1.0
-DEFAULT_WARMUP_EPOCHS = 4
-DEFAULT_WARMUP_START_FACTOR = 0.1
-DEFAULT_MIN_LR_RATIO = 0.1
-DEFAULT_EARLY_STOPPING_PATIENCE = 15
-DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac")
+DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp32"
+DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_features")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train frozen-encoder RC JEPA-AC world model.")
+    parser = argparse.ArgumentParser(description="Train RC JEPA-AC predictor from cached V-JEPA features.")
+    parser.add_argument("--features-dir", type=Path, default=DEFAULT_FEATURES_DIR)
     parser.add_argument("--manifest-dir", type=Path, default=settings.MANIFEST_DIR)
-    parser.add_argument("--vjepa-root", type=Path, default=settings.REPO_ROOT / "vjepa2")
-    parser.add_argument("--vjepa-checkpoint", type=Path, required=True)
-    parser.add_argument("--checkpoint-key", default=DEFAULT_CHECKPOINT_KEY)
-    parser.add_argument("--allow-partial-checkpoint", action="store_true")
-    parser.add_argument("--encoder", default=DEFAULT_ENCODER_NAME, choices=["vit_small_384", "vit_base_384", "vit_large_384"])
     parser.add_argument("--state-columns", nargs="+", default=list(DEFAULT_AC_STATE_COLUMNS))
     parser.add_argument("--action-columns", nargs="+", default=list(DEFAULT_AC_ACTION_COLUMNS))
     parser.add_argument("--raw-frames-per-sample", type=int, default=settings.AC_RAW_FRAMES_PER_SAMPLE)
     parser.add_argument("--sequence-stride", type=int, default=settings.AC_SEQUENCE_STRIDE)
-    parser.add_argument("--image-size", type=int, default=settings.AC_IMAGE_SIZE)
-    parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
-    parser.add_argument("--tubelet-size", type=int, default=settings.AC_TUBELET_SIZE)
     parser.add_argument("--auto-steps", type=int, default=settings.AC_AUTO_STEPS)
     parser.add_argument("--predictor-dim", type=int, default=DEFAULT_PREDICTOR_DIM)
     parser.add_argument("--predictor-depth", type=int, default=DEFAULT_PREDICTOR_DEPTH)
@@ -109,95 +107,30 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_model(args: argparse.Namespace) -> RCJepaACWorldModel:
-    return RCJepaACWorldModel(
-        vjepa_root=args.vjepa_root,
-        checkpoint_path=args.vjepa_checkpoint,
-        encoder_name=args.encoder,
-        checkpoint_key=args.checkpoint_key,
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        tubelet_size=args.tubelet_size,
-        raw_frames_per_sample=args.raw_frames_per_sample,
+def build_predictor(args: argparse.Namespace, tokens_per_frame: int, embed_dim: int) -> SimpleACPredictor:
+    return SimpleACPredictor(
+        latent_dim=embed_dim,
         state_dim=len(args.state_columns),
         action_dim=len(args.action_columns),
-        state_columns=tuple(args.state_columns),
-        action_columns=tuple(args.action_columns),
+        tokens_per_frame=tokens_per_frame,
+        max_frames=args.raw_frames_per_sample,
         predictor_dim=args.predictor_dim,
-        predictor_depth=args.predictor_depth,
-        predictor_heads=args.predictor_heads,
+        depth=args.predictor_depth,
+        num_heads=args.predictor_heads,
         dropout=args.dropout,
-        auto_steps=args.auto_steps,
-        strict_checkpoint=not args.allow_partial_checkpoint,
     )
-
-
-def compute_steps_per_epoch(dataloader: torch.utils.data.DataLoader) -> int:
-    return max(len(dataloader), 1)
-
-
-def compute_warmup_steps(warmup_epochs: int, steps_per_epoch: int, total_train_steps: int) -> int:
-    if warmup_epochs <= 0:
-        return 0
-    return min(warmup_epochs * steps_per_epoch, max(total_train_steps - 1, 0))
-
-
-def should_apply_early_stopping(epoch: int, warmup_epochs: int) -> bool:
-    return epoch > max(warmup_epochs, 0)
-
-
-def compute_lr_scale(
-    step: int,
-    total_train_steps: int,
-    warmup_steps: int,
-    warmup_start_factor: float,
-    min_lr_ratio: float,
-) -> float:
-    if total_train_steps <= 0:
-        return 1.0
-
-    step = min(max(step, 0), total_train_steps)
-    if warmup_steps > 0 and step < warmup_steps:
-        warmup_progress = step / max(warmup_steps, 1)
-        return warmup_start_factor + (1.0 - warmup_start_factor) * warmup_progress
-
-    if total_train_steps <= warmup_steps:
-        return 1.0
-
-    cosine_progress = (step - warmup_steps) / max(total_train_steps - warmup_steps, 1)
-    cosine_progress = min(max(cosine_progress, 0.0), 1.0)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
-    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-
-def apply_learning_rate(
-    optimizer: torch.optim.Optimizer,
-    base_lr: float,
-    global_step: int,
-    total_train_steps: int,
-    warmup_steps: int,
-    warmup_start_factor: float,
-    min_lr_ratio: float,
-) -> float:
-    lr_scale = compute_lr_scale(
-        step=global_step,
-        total_train_steps=total_train_steps,
-        warmup_steps=warmup_steps,
-        warmup_start_factor=warmup_start_factor,
-        min_lr_ratio=min_lr_ratio,
-    )
-    lr = base_lr * lr_scale
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
-    return lr
 
 
 def run_epoch(
-    model: nn.Module,
+    predictor: nn.Module,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     grad_clip: float,
+    tokens_per_frame: int,
+    auto_steps: int,
+    state_columns: tuple[str, ...],
+    action_columns: tuple[str, ...],
     label: str,
     show_progress: bool,
     wandb_run: Any | None = None,
@@ -214,22 +147,16 @@ def run_epoch(
     wandb_param_stats_every: int = 0,
 ) -> tuple[dict[str, float], int]:
     training = optimizer is not None
-    model.train(training)
-
+    predictor.train(training)
     totals = {
         "loss": 0.0,
         "teacher_forcing_loss": 0.0,
         "rollout_loss": 0.0,
     }
     total_samples = 0
-    progress = tqdm(
-        dataloader,
-        desc=label,
-        leave=False,
-        disable=not show_progress,
-    )
-
     global_step = global_step_start
+    progress = tqdm(dataloader, desc=label, leave=False, disable=not show_progress)
+
     for step, batch in enumerate(progress, start=1):
         should_log_batch = (
             training
@@ -242,7 +169,7 @@ def run_epoch(
         should_log_param_stats = should_log_batch and wandb_param_stats_every > 0 and step % wandb_param_stats_every == 0
         extra_batch_metrics: dict[str, float] = {}
 
-        images = batch["images"].to(device, non_blocking=True)
+        latents = batch["latents"].to(device, non_blocking=True)
         states = batch["states"].to(device, non_blocking=True)
         actions = batch["actions"].to(device, non_blocking=True)
 
@@ -263,25 +190,33 @@ def run_epoch(
             current_lr = None
 
         with torch.set_grad_enabled(training):
-            outputs = model(images=images, states=states, actions=actions)
+            outputs = compute_world_model_losses(
+                predictor=predictor,
+                latents=latents,
+                states=states,
+                actions=actions,
+                tokens_per_frame=tokens_per_frame,
+                auto_steps=auto_steps,
+                state_columns=state_columns,
+                action_columns=action_columns,
+            )
             loss = outputs["loss"]
-
             if training:
                 loss.backward()
                 if should_log_grad_stats:
-                    extra_batch_metrics.update(collect_gradient_metrics(model, prefix="grad_pre_clip"))
+                    extra_batch_metrics.update(collect_gradient_metrics(predictor, prefix="grad_pre_clip"))
                 if grad_clip > 0:
-                    pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    pre_clip_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), grad_clip)
                     if should_log_grad_stats:
                         extra_batch_metrics["grad_clip/pre_clip_global_l2"] = float(pre_clip_norm)
                         extra_batch_metrics["grad_clip/max_norm"] = float(grad_clip)
                 if should_log_grad_stats:
-                    extra_batch_metrics.update(collect_gradient_metrics(model, prefix="grad_post_clip"))
+                    extra_batch_metrics.update(collect_gradient_metrics(predictor, prefix="grad_post_clip"))
                 optimizer.step()
                 if should_log_param_stats:
-                    extra_batch_metrics.update(collect_parameter_metrics(model, prefix="param"))
+                    extra_batch_metrics.update(collect_parameter_metrics(predictor, prefix="param"))
 
-        batch_size = images.size(0)
+        batch_size = latents.size(0)
         for key in totals:
             totals[key] += float(outputs[key].detach().item()) * batch_size
         total_samples += batch_size
@@ -290,19 +225,12 @@ def run_epoch(
         if training:
             global_step += 1
             if should_log_batch:
-                batch_metrics = {
-                    key: float(value.detach().item())
-                    for key, value in outputs.items()
-                }
+                batch_metrics = {key: float(value.detach().item()) for key, value in outputs.items()}
                 batch_metrics["epoch"] = float(epoch or 0)
                 if current_lr is not None:
                     batch_metrics["lr"] = current_lr
                 batch_metrics.update(extra_batch_metrics)
-                log_metrics(
-                    wandb_run,
-                    flatten_metrics(wandb_prefix, batch_metrics),
-                    step=global_step,
-                )
+                log_metrics(wandb_run, flatten_metrics(wandb_prefix, batch_metrics), step=global_step)
 
     return average_metrics(totals, total_samples), global_step
 
@@ -311,38 +239,11 @@ def average_metrics(totals: dict[str, float], total_samples: int) -> dict[str, f
     return {key: value / max(total_samples, 1) for key, value in totals.items()}
 
 
-def save_checkpoint(
-    path: Path,
-    model: RCJepaACWorldModel,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    args: argparse.Namespace,
-    metrics: dict[str, Any],
-    normalization: dict[str, Any],
-    best_val_loss: float,
-    best_epoch: int,
-    global_step: int,
-    epochs_without_improvement: int,
-    history: list[dict[str, Any]],
-) -> None:
-    payload = {
-        "epoch": epoch,
-        "predictor_state_dict": model.predictor.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "args": args_to_jsonable_dict(args),
-        "metrics": metrics,
-        "state_columns": list(args.state_columns),
-        "action_columns": list(args.action_columns),
-        "normalization": normalization,
-        "encoder_checkpoint_path": str(args.vjepa_checkpoint),
-        "best_val_loss": best_val_loss,
-        "best_epoch": best_epoch,
-        "global_step": global_step,
-        "epochs_without_improvement": epochs_without_improvement,
-        "history": history,
-        "note": "Frozen V-JEPA 2.1 encoder weights are not saved in this checkpoint.",
+def collect_normalization_metadata(dataset: Any) -> dict[str, Any]:
+    return {
+        "state": normalizer_to_dict(getattr(dataset, "state_normalizer", None)),
+        "action": normalizer_to_dict(getattr(dataset, "action_normalizer", None)),
     }
-    torch.save(payload, path)
 
 
 def args_to_jsonable_dict(args: argparse.Namespace) -> dict[str, Any]:
@@ -357,13 +258,6 @@ def args_to_jsonable_dict(args: argparse.Namespace) -> dict[str, Any]:
 
 def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def collect_normalization_metadata(dataset: Any) -> dict[str, Any]:
-    return {
-        "state": normalizer_to_dict(getattr(dataset, "state_normalizer", None)),
-        "action": normalizer_to_dict(getattr(dataset, "action_normalizer", None)),
-    }
 
 
 def epoch_wandb_metrics(
@@ -386,26 +280,70 @@ def epoch_wandb_metrics(
     }
 
 
+def save_checkpoint(
+    path: Path,
+    predictor: SimpleACPredictor,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    args: argparse.Namespace,
+    metrics: dict[str, Any],
+    normalization: dict[str, Any],
+    feature_metadata: dict[str, Any],
+    best_val_loss: float,
+    best_epoch: int,
+    global_step: int,
+    epochs_without_improvement: int,
+    history: list[dict[str, Any]],
+    phase: str = "epoch_complete",
+) -> None:
+    payload = {
+        "epoch": epoch,
+        "phase": phase,
+        "predictor_state_dict": predictor.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": args_to_jsonable_dict(args),
+        "metrics": metrics,
+        "state_columns": list(args.state_columns),
+        "action_columns": list(args.action_columns),
+        "normalization": normalization,
+        "feature_metadata": feature_metadata,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "global_step": global_step,
+        "epochs_without_improvement": epochs_without_improvement,
+        "history": history,
+        "note": "Trained from precomputed V-JEPA features. Encoder weights are not saved.",
+    }
+    torch.save(payload, path)
+
+
 def load_resume_checkpoint(
     resume_path: Path,
-    model: RCJepaACWorldModel,
+    predictor: SimpleACPredictor,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> dict[str, Any]:
     checkpoint = torch.load(resume_path, map_location=device)
-    model.predictor.load_state_dict(checkpoint["predictor_state_dict"])
+    predictor.load_state_dict(checkpoint["predictor_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
+
+
+def maybe_cleanup_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    epochs_dir = args.output_dir / "epochs"
+    epochs_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    dataloaders = create_ac_sequence_dataloaders(
+    dataloaders = create_ac_feature_sequence_dataloaders(
+        features_dir=args.features_dir,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
@@ -415,30 +353,35 @@ def main() -> None:
         state_columns=args.state_columns,
         action_columns=args.action_columns,
     )
+    train_dataset = dataloaders["train"].dataset
+    tokens_per_frame = int(train_dataset.tokens_per_frame)
+    embed_dim = int(train_dataset.embed_dim)
+    feature_metadata = dict(train_dataset.feature_metadata)
 
-    model = build_model(args).to(device)
+    predictor = build_predictor(args, tokens_per_frame=tokens_per_frame, embed_dim=embed_dim).to(device)
     optimizer = AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        [parameter for parameter in predictor.parameters() if parameter.requires_grad],
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+
     steps_per_epoch = compute_steps_per_epoch(dataloaders["train"])
     total_train_steps = args.epochs * steps_per_epoch
     warmup_steps = compute_warmup_steps(args.warmup_epochs, steps_per_epoch, total_train_steps)
-    epochs_dir = args.output_dir / "epochs"
-    epochs_dir.mkdir(parents=True, exist_ok=True)
-
-    normalization_metadata = collect_normalization_metadata(dataloaders["train"].dataset)
+    normalization_metadata = collect_normalization_metadata(train_dataset)
     run_config = {
         "device": str(device),
         "train_sequences": len(dataloaders["train"].dataset),
         "val_sequences": len(dataloaders["val"].dataset),
         "test_sequences": len(dataloaders["test"].dataset),
-        "trainable_parameters": count_trainable_parameters(model),
+        "trainable_parameters": count_trainable_parameters(predictor),
+        "tokens_per_frame": tokens_per_frame,
+        "embed_dim": embed_dim,
         "steps_per_epoch": steps_per_epoch,
         "total_train_steps": total_train_steps,
         "warmup_steps": warmup_steps,
         "normalization": normalization_metadata,
+        "feature_metadata": feature_metadata,
         "args": args_to_jsonable_dict(args),
     }
     print(json.dumps(run_config, indent=2), flush=True)
@@ -451,87 +394,99 @@ def main() -> None:
     start_epoch = 1
     global_step = 0
     resumed_from = None
+    resume_phase = "train"
+    resumed_train_metrics: dict[str, float] | None = None
     if args.resume_from is not None:
         resumed_from = args.resume_from
-        checkpoint = load_resume_checkpoint(
-            resume_path=args.resume_from,
-            model=model,
-            optimizer=optimizer,
-            device=device,
-        )
-        start_epoch = int(checkpoint["epoch"]) + 1
+        checkpoint = load_resume_checkpoint(args.resume_from, predictor, optimizer, device)
+        resume_phase = str(checkpoint.get("phase", "epoch_complete"))
+        if resume_phase == "train_complete_waiting_val":
+            start_epoch = int(checkpoint["epoch"])
+            metrics_payload = checkpoint.get("metrics", {})
+            resumed_train_metrics = dict(metrics_payload.get("train", {}))
+        else:
+            start_epoch = int(checkpoint["epoch"]) + 1
         best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
         best_epoch = int(checkpoint.get("best_epoch", 0))
         global_step = int(checkpoint.get("global_step", 0))
         epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", 0))
         history = list(checkpoint.get("history", []))
-        print(
-            json.dumps(
-                {
-                    "resume_from": str(args.resume_from),
-                    "start_epoch": start_epoch,
-                    "best_val_loss": best_val_loss,
-                    "best_epoch": best_epoch,
-                    "global_step": global_step,
-                    "epochs_without_improvement": epochs_without_improvement,
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
         if start_epoch > args.epochs:
             raise ValueError(
                 f"Resume checkpoint already finished epoch {checkpoint['epoch']}, "
                 f"but --epochs={args.epochs}. Increase --epochs to continue."
             )
-    wandb_run = init_wandb(args, config=run_config, job_type="train-rc-jepa-ac")
-    watch_model(wandb_run, model.predictor, args)
 
+    wandb_run = init_wandb(args, config=run_config, job_type="train-rc-jepa-ac-features")
+    watch_model(wandb_run, predictor, args)
     try:
         final_epoch = start_epoch - 1
         for epoch in range(start_epoch, args.epochs + 1):
             final_epoch = epoch
-            train_metrics, global_step = run_epoch(
-                model=model,
-                dataloader=dataloaders["train"],
-                device=device,
-                optimizer=optimizer,
-                grad_clip=args.grad_clip,
-                label=f"epoch {epoch:03d}/{args.epochs:03d} train",
-                show_progress=not args.no_progress,
-                wandb_run=wandb_run,
-                wandb_prefix="train_batch",
-                wandb_log_every=args.wandb_log_every,
-                epoch=epoch,
-                global_step_start=global_step,
-                base_lr=args.lr,
-                total_train_steps=total_train_steps,
-                warmup_steps=warmup_steps,
-                warmup_start_factor=args.warmup_start_factor,
-                min_lr_ratio=args.min_lr_ratio,
-                wandb_grad_stats_every=args.wandb_grad_stats_every,
-                wandb_param_stats_every=args.wandb_param_stats_every,
-            )
-
+            if epoch == start_epoch and resume_phase == "train_complete_waiting_val" and resumed_train_metrics is not None:
+                train_metrics = resumed_train_metrics
+            else:
+                train_metrics, global_step = run_epoch(
+                    predictor=predictor,
+                    dataloader=dataloaders["train"],
+                    device=device,
+                    optimizer=optimizer,
+                    grad_clip=args.grad_clip,
+                    tokens_per_frame=tokens_per_frame,
+                    auto_steps=args.auto_steps,
+                    state_columns=tuple(args.state_columns),
+                    action_columns=tuple(args.action_columns),
+                    label=f"epoch {epoch:03d}/{args.epochs:03d} train",
+                    show_progress=not args.no_progress,
+                    wandb_run=wandb_run,
+                    wandb_prefix="train_batch",
+                    wandb_log_every=args.wandb_log_every,
+                    epoch=epoch,
+                    global_step_start=global_step,
+                    base_lr=args.lr,
+                    total_train_steps=total_train_steps,
+                    warmup_steps=warmup_steps,
+                    warmup_start_factor=args.warmup_start_factor,
+                    min_lr_ratio=args.min_lr_ratio,
+                    wandb_grad_stats_every=args.wandb_grad_stats_every,
+                    wandb_param_stats_every=args.wandb_param_stats_every,
+                )
+                train_only_metrics = {"epoch": epoch, "train": train_metrics}
+                save_checkpoint(
+                    args.output_dir / "last_train.pt",
+                    predictor,
+                    optimizer,
+                    epoch,
+                    args,
+                    train_only_metrics,
+                    normalization_metadata,
+                    feature_metadata,
+                    best_val_loss,
+                    best_epoch,
+                    global_step,
+                    epochs_without_improvement,
+                    history,
+                    phase="train_complete_waiting_val",
+                )
+            maybe_cleanup_cuda()
             with torch.no_grad():
                 val_metrics, _ = run_epoch(
-                    model=model,
+                    predictor=predictor,
                     dataloader=dataloaders["val"],
                     device=device,
                     optimizer=None,
                     grad_clip=args.grad_clip,
+                    tokens_per_frame=tokens_per_frame,
+                    auto_steps=args.auto_steps,
+                    state_columns=tuple(args.state_columns),
+                    action_columns=tuple(args.action_columns),
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val",
                     show_progress=not args.no_progress,
                 )
 
-            epoch_metrics = {
-                "epoch": epoch,
-                "train": train_metrics,
-                "val": val_metrics,
-            }
+            epoch_metrics = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
             history.append(epoch_metrics)
             write_json(args.output_dir / "history.json", history)
-
             print(
                 f"[epoch {epoch:03d}] "
                 f"train_loss={train_metrics['loss']:.5f} "
@@ -551,48 +506,39 @@ def main() -> None:
             elif should_apply_early_stopping(epoch=epoch, warmup_epochs=args.warmup_epochs):
                 epochs_without_improvement += 1
 
-            save_checkpoint(
-                args.output_dir / "last.pt",
-                model,
-                optimizer,
-                epoch,
-                args,
-                epoch_metrics,
-                normalization_metadata,
-                best_val_loss=best_val_loss,
-                best_epoch=best_epoch,
-                global_step=global_step,
-                epochs_without_improvement=epochs_without_improvement,
-                history=history,
-            )
-            save_checkpoint(
-                epochs_dir / f"epoch_{epoch:03d}.pt",
-                model,
-                optimizer,
-                epoch,
-                args,
-                epoch_metrics,
-                normalization_metadata,
-                best_val_loss=best_val_loss,
-                best_epoch=best_epoch,
-                global_step=global_step,
-                epochs_without_improvement=epochs_without_improvement,
-                history=history,
-            )
-            if improved:
+            for checkpoint_path in (args.output_dir / "last.pt", epochs_dir / f"epoch_{epoch:03d}.pt"):
                 save_checkpoint(
-                    args.output_dir / "best.pt",
-                    model,
+                    checkpoint_path,
+                    predictor,
                     optimizer,
                     epoch,
                     args,
                     epoch_metrics,
                     normalization_metadata,
-                    best_val_loss=best_val_loss,
-                    best_epoch=best_epoch,
-                    global_step=global_step,
-                    epochs_without_improvement=epochs_without_improvement,
-                    history=history,
+                    feature_metadata,
+                    best_val_loss,
+                    best_epoch,
+                    global_step,
+                    epochs_without_improvement,
+                    history,
+                    phase="epoch_complete",
+                )
+            if improved:
+                save_checkpoint(
+                    args.output_dir / "best.pt",
+                    predictor,
+                    optimizer,
+                    epoch,
+                    args,
+                    epoch_metrics,
+                    normalization_metadata,
+                    feature_metadata,
+                    best_val_loss,
+                    best_epoch,
+                    global_step,
+                    epochs_without_improvement,
+                    history,
+                    phase="epoch_complete",
                 )
 
             log_metrics(
@@ -608,7 +554,6 @@ def main() -> None:
                 ),
                 step=global_step,
             )
-
             if (
                 args.early_stopping_patience > 0
                 and should_apply_early_stopping(epoch=epoch, warmup_epochs=args.warmup_epochs)
@@ -630,15 +575,19 @@ def main() -> None:
                 break
 
         best_checkpoint = torch.load(args.output_dir / "best.pt", map_location=device)
-        model.predictor.load_state_dict(best_checkpoint["predictor_state_dict"])
-
+        predictor.load_state_dict(best_checkpoint["predictor_state_dict"])
+        maybe_cleanup_cuda()
         with torch.no_grad():
             test_metrics, _ = run_epoch(
-                model=model,
+                predictor=predictor,
                 dataloader=dataloaders["test"],
                 device=device,
                 optimizer=None,
                 grad_clip=args.grad_clip,
+                tokens_per_frame=tokens_per_frame,
+                auto_steps=args.auto_steps,
+                state_columns=tuple(args.state_columns),
+                action_columns=tuple(args.action_columns),
                 label="test",
                 show_progress=not args.no_progress,
             )

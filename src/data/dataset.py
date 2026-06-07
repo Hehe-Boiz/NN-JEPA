@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from . import settings
+from .normalization import FeatureNormalizer, build_feature_normalizer
 
 HORIZONTAL_FLIP_SIGN_COLUMNS = {
     "yaw_rate_t": -1.0,
@@ -70,10 +71,12 @@ class DrivingJEPADataset(Dataset):
         self,
         split: str,
         manifest_path: str | Path | None = None,
+        state_normalizer: FeatureNormalizer | None = None,
     ) -> None:
         self.split = split
         self.manifest_path = Path(manifest_path or settings.MANIFEST_DIR / f"{split}.jsonl")
         self.samples = load_manifest(self.manifest_path)
+        self.state_normalizer = state_normalizer
         self.augmentor = TrainAugmentor() if split == "train" else None
 
     def __len__(self) -> int:
@@ -95,10 +98,11 @@ class DrivingJEPADataset(Dataset):
             mean=list(settings.NORMALIZE_MEAN),
             std=list(settings.NORMALIZE_STD),
         )
-        state_tensor = torch.tensor(
-            [state[column] for column in settings.STATE_COLUMNS],
-            dtype=torch.float32,
-        )
+        if self.state_normalizer is None:
+            state_values = [state[column] for column in settings.STATE_COLUMNS]
+        else:
+            state_values = self.state_normalizer.normalize_row(state, settings.STATE_COLUMNS)
+        state_tensor = torch.tensor(state_values, dtype=torch.float32)
         action_tensor = torch.tensor(
             [action[column] for column in settings.ACTION_COLUMNS],
             dtype=torch.float32,
@@ -152,11 +156,25 @@ def create_dataloaders(
 ) -> dict[str, DataLoader]:
     batch_size = batch_size or settings.BATCH_SIZE
     num_workers = settings.NUM_WORKERS if num_workers is None else num_workers
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": settings.PIN_MEMORY,
+        "persistent_workers": settings.PERSISTENT_WORKERS and num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = settings.PREFETCH_FACTOR
+    train_samples = load_manifest(settings.MANIFEST_DIR / "train.jsonl")
+    state_normalizer = (
+        build_feature_normalizer(train_samples, settings.STATE_COLUMNS, source_key="state")
+        if settings.NORMALIZE_STATE_INPUTS
+        else None
+    )
 
     datasets = {
         split: DrivingJEPADataset(
             split=split,
             manifest_path=settings.MANIFEST_DIR / f"{split}.jsonl",
+            state_normalizer=state_normalizer,
         )
         for split in ("train", "val", "test")
     }
@@ -166,25 +184,19 @@ def create_dataloaders(
             datasets["train"],
             batch_size=batch_size,
             shuffle=settings.SHUFFLE_TRAIN,
-            num_workers=num_workers,
-            pin_memory=settings.PIN_MEMORY,
-            persistent_workers=settings.PERSISTENT_WORKERS and num_workers > 0,
+            **loader_kwargs,
         ),
         "val": DataLoader(
             datasets["val"],
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=settings.PIN_MEMORY,
-            persistent_workers=settings.PERSISTENT_WORKERS and num_workers > 0,
+            **loader_kwargs,
         ),
         "test": DataLoader(
             datasets["test"],
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=settings.PIN_MEMORY,
-            persistent_workers=settings.PERSISTENT_WORKERS and num_workers > 0,
+            **loader_kwargs,
         ),
     }
     return dataloaders

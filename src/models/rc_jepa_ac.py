@@ -254,6 +254,8 @@ class RCJepaACWorldModel(nn.Module):
         raw_frames_per_sample: int = settings.AC_RAW_FRAMES_PER_SAMPLE,
         state_dim: int = len(settings.AC_STATE_COLUMNS),
         action_dim: int = len(settings.AC_ACTION_COLUMNS),
+        state_columns: tuple[str, ...] = tuple(settings.AC_STATE_COLUMNS),
+        action_columns: tuple[str, ...] = tuple(settings.AC_ACTION_COLUMNS),
         predictor_dim: int = DEFAULT_PREDICTOR_DIM,
         predictor_depth: int = DEFAULT_PREDICTOR_DEPTH,
         predictor_heads: int = DEFAULT_PREDICTOR_HEADS,
@@ -264,6 +266,8 @@ class RCJepaACWorldModel(nn.Module):
         super().__init__()
         self.raw_frames_per_sample = raw_frames_per_sample
         self.auto_steps = auto_steps
+        self.state_columns = tuple(state_columns)
+        self.action_columns = tuple(action_columns)
         self.target_encoder = FrozenVJepa21Encoder(
             vjepa_root=vjepa_root,
             checkpoint_path=checkpoint_path,
@@ -305,6 +309,8 @@ class RCJepaACWorldModel(nn.Module):
             actions=actions,
             tokens_per_frame=tokens_per_frame,
             auto_steps=self.auto_steps,
+            state_columns=self.state_columns,
+            action_columns=self.action_columns,
         )
 
 
@@ -315,6 +321,8 @@ def compute_world_model_losses(
     actions: torch.Tensor,
     tokens_per_frame: int,
     auto_steps: int,
+    state_columns: tuple[str, ...] | None = None,
+    action_columns: tuple[str, ...] | None = None,
 ) -> dict[str, torch.Tensor]:
     if auto_steps < 1:
         raise ValueError("auto_steps must be >= 1")
@@ -337,12 +345,19 @@ def compute_world_model_losses(
 
     rollout_steps = min(auto_steps, num_frames - 1)
     rollout_tokens = latents[:, :tokens_per_frame]
+    rollout_states = build_rollout_state_context(
+        initial_state=states[:, :1],
+        actions=actions,
+        rollout_steps=rollout_steps,
+        state_columns=state_columns,
+        action_columns=action_columns,
+    )
     rollout_predictions = []
     for step in range(rollout_steps):
         pred_tokens = predictor(
             latent_tokens=rollout_tokens,
             actions=actions[:, : step + 1],
-            states=states[:, : step + 1],
+            states=rollout_states[:, : step + 1],
             tokens_per_frame=tokens_per_frame,
         )
         next_tokens = pred_tokens[:, -tokens_per_frame:]
@@ -359,6 +374,53 @@ def compute_world_model_losses(
         "teacher_forcing_loss": teacher_forcing_loss,
         "rollout_loss": rollout_loss,
     }
+
+
+def build_rollout_state_context(
+    initial_state: torch.Tensor,
+    actions: torch.Tensor,
+    rollout_steps: int,
+    state_columns: tuple[str, ...] | None = None,
+    action_columns: tuple[str, ...] | None = None,
+) -> torch.Tensor:
+    """Build rollout state inputs without using future measured state."""
+    rollout_states = initial_state.repeat(1, rollout_steps, 1)
+    if rollout_steps <= 1 or state_columns is None or action_columns is None:
+        return rollout_states
+
+    copy_previous_action_to_state(
+        rollout_states,
+        actions,
+        state_columns=state_columns,
+        action_columns=action_columns,
+        state_name="steering_last_t",
+        action_name="steering_cmd_t",
+    )
+    copy_previous_action_to_state(
+        rollout_states,
+        actions,
+        state_columns=state_columns,
+        action_columns=action_columns,
+        state_name="throttle_last_t",
+        action_name="throttle_cmd_t",
+    )
+    return rollout_states
+
+
+def copy_previous_action_to_state(
+    rollout_states: torch.Tensor,
+    actions: torch.Tensor,
+    state_columns: tuple[str, ...],
+    action_columns: tuple[str, ...],
+    state_name: str,
+    action_name: str,
+) -> None:
+    if state_name not in state_columns or action_name not in action_columns:
+        return
+    state_index = state_columns.index(state_name)
+    action_index = action_columns.index(action_name)
+    for step in range(1, rollout_states.size(1)):
+        rollout_states[:, step, state_index] = actions[:, step - 1, action_index]
 
 
 def build_time_causal_mask(num_frames: int, tokens_per_step: int, device: torch.device) -> torch.Tensor:

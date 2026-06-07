@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NN-JEPA Session Viewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <h1>NN-JEPA Viewer</h1>
+        <label class="field">
+          <span>Source</span>
+          <select id="sourceSelect">
+            <option value="raw">raw</option>
+            <option value="processed">processed</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Session</span>
+          <select id="sessionSelect"></select>
+        </label>
+        <button id="reloadButton" type="button">Reload Sessions</button>
+        <div class="meta">
+          <div><strong>Frames:</strong> <span id="frameCount">-</span></div>
+          <div><strong>Files:</strong> <span id="fileList">-</span></div>
+        </div>
+        <p class="hint">
+          Keyboard: <code>Space</code> play/pause, <code>Left</code>/<code>Right</code> step frame.
+        </p>
+      </aside>
+
+      <main class="main">
+        <div class="viewer">
+          <img id="frameImage" alt="Session frame" />
+        </div>
+
+        <div class="controls">
+          <div class="row">
+            <button id="playPauseButton" type="button">Play</button>
+            <button id="prevFrameButton" type="button">Prev</button>
+            <button id="nextFrameButton" type="button">Next</button>
+            <label>
+              FPS
+              <input id="fpsInput" type="number" min="1" max="60" value="12" />
+            </label>
+          </div>
+
+          <div class="row">
+            <input id="frameSlider" type="range" min="0" max="0" value="0" />
+          </div>
+
+          <div class="row status">
+            <span id="frameLabel">Frame 0 / 0</span>
+            <span id="sessionLabel">No session loaded</span>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

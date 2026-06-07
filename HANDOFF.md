@@ -98,9 +98,9 @@ Không phải:
 Dataset sequence đọc manifest:
 
 ```text
-JEPA/data/processed/manifests/train.jsonl
-JEPA/data/processed/manifests/val.jsonl
-JEPA/data/processed/manifests/test.jsonl
+data/processed/manifests/train.jsonl
+data/processed/manifests/val.jsonl
+data/processed/manifests/test.jsonl
 ```
 
 Một item dataset trả về:
@@ -180,7 +180,7 @@ Ví dụ:
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac \
   --vjepa-checkpoint /path/to/vjepa2_1_checkpoint.pt \
   --vjepa-root vjepa2 \
-  --manifest-dir JEPA/data/processed/manifests \
+  --manifest-dir data/processed/manifests \
   --output-dir checkpoints/rc_jepa_ac
 ```
 
@@ -226,6 +226,43 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 Kết quả pass.
 
 Lưu ý: môi trường shell lúc đó chưa có `torch`, nên test tensor/model bị skip. Code mới vẫn import torch trực tiếp, không có fallback.
+
+## Cập nhật mới nhất cần nhớ
+
+Các lỗi logic train đã được sửa:
+
+- `rc_jepa_ac` rollout không dùng state tương lai thật nữa.
+- Sequence dataset chặn window bị đứt frame/time bằng `AC_MAX_FRAME_INDEX_GAP` và `AC_MAX_TIME_GAP_SEC`.
+- State/action numeric input được normalize bằng stats từ train manifest.
+- Checkpoint train lưu metadata normalization để inference dùng lại đúng scale.
+- Outlier robust đang bật bằng `REMOVE_SIMPLE_OUTLIERS = True`.
+
+Manifest mới sau preprocess:
+
+```text
+train: 29195 samples
+val:    6484 samples
+test:   13579 samples
+```
+
+Report:
+
+```text
+data/processed/reports/preprocess_report.json
+```
+
+W&B đang bật mặc định cho hai script train:
+
+```text
+project: nn-jepa-rc
+metrics: train/*, val/*, test/*, best/val_loss, lr
+```
+
+Tắt bằng:
+
+```bash
+--no-wandb
+```
 
 ## Việc cần làm tiếp
 

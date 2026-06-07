@@ -19,7 +19,9 @@ from data.preprocess import (
     read_state,
     read_timestamp,
     read_timestamp_ms,
+    remove_simple_outliers,
 )
+from data.normalization import build_feature_normalizer
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 if TORCH_AVAILABLE:
@@ -178,6 +180,38 @@ class SimplePipelineTests(unittest.TestCase):
             self.assertEqual(report["missing_synced_imu_rows"], 0)
             self.assertEqual(merged_rows[0]["gz"], "0.75")
             self.assertEqual(merged_rows[0]["ax"], "1.50")
+
+    def test_robust_outlier_filter_drops_sensor_spikes(self) -> None:
+        samples = []
+        for index, accel_y in enumerate([0.0, 0.1, -0.1, 0.2, 50.0]):
+            samples.append(
+                {
+                    "state": {
+                        "v_t": 0.0,
+                        "yaw_rate_t": 0.0,
+                        "accel_x_t": 9.8,
+                        "accel_y_t": accel_y,
+                    }
+                }
+            )
+
+        kept, dropped = remove_simple_outliers(samples)
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(kept), 4)
+        self.assertNotIn(50.0, [sample["state"]["accel_y_t"] for sample in kept])
+
+    def test_feature_normalizer_uses_train_stats(self) -> None:
+        samples = [
+            {"state": {"yaw_rate_t": 1.0}},
+            {"state": {"yaw_rate_t": 3.0}},
+            {"state": {"yaw_rate_t": 5.0}},
+        ]
+
+        normalizer = build_feature_normalizer(samples, ["yaw_rate_t"], source_key="state")
+        row = normalizer.normalize_row({"yaw_rate_t": 3.0}, ["yaw_rate_t"])
+
+        self.assertAlmostEqual(row[0], 0.0)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_horizontal_flip_inverts_control_sensitive_columns(self) -> None:
