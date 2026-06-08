@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +23,14 @@ from models.rc_jepa_ac import (
     DEFAULT_CHECKPOINT_KEY,
     DEFAULT_ENCODER_NAME,
     DEFAULT_PATCH_SIZE,
-    DEFAULT_PREDICTOR_DEPTH,
-    DEFAULT_PREDICTOR_DIM,
-    DEFAULT_PREDICTOR_HEADS,
+    DEFAULT_PREDICTOR_TYPE,
+    PREDICTOR_SIZE_PRESETS,
     RCJepaACWorldModel,
+    SUPPORTED_PREDICTOR_TYPES,
+    apply_predictor_size_preset,
     count_trainable_parameters,
 )
+from models.vjepa21_presets import SUPPORTED_VJEPA21_ENCODER_NAMES
 from tools.wandb_utils import (
     add_wandb_args,
     collect_gradient_metrics,
@@ -55,14 +58,15 @@ DEFAULT_EARLY_STOPPING_PATIENCE = 15
 DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description="Train frozen-encoder RC JEPA-AC world model.")
     parser.add_argument("--manifest-dir", type=Path, default=settings.MANIFEST_DIR)
     parser.add_argument("--vjepa-root", type=Path, default=settings.REPO_ROOT / "vjepa2")
     parser.add_argument("--vjepa-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint-key", default=DEFAULT_CHECKPOINT_KEY)
     parser.add_argument("--allow-partial-checkpoint", action="store_true")
-    parser.add_argument("--encoder", default=DEFAULT_ENCODER_NAME, choices=["vit_small_384", "vit_base_384", "vit_large_384"])
+    parser.add_argument("--encoder", default=DEFAULT_ENCODER_NAME, choices=list(SUPPORTED_VJEPA21_ENCODER_NAMES))
     parser.add_argument("--state-columns", nargs="+", default=list(DEFAULT_AC_STATE_COLUMNS))
     parser.add_argument("--action-columns", nargs="+", default=list(DEFAULT_AC_ACTION_COLUMNS))
     parser.add_argument("--raw-frames-per-sample", type=int, default=settings.AC_RAW_FRAMES_PER_SAMPLE)
@@ -71,9 +75,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--tubelet-size", type=int, default=settings.AC_TUBELET_SIZE)
     parser.add_argument("--auto-steps", type=int, default=settings.AC_AUTO_STEPS)
-    parser.add_argument("--predictor-dim", type=int, default=DEFAULT_PREDICTOR_DIM)
-    parser.add_argument("--predictor-depth", type=int, default=DEFAULT_PREDICTOR_DEPTH)
-    parser.add_argument("--predictor-heads", type=int, default=DEFAULT_PREDICTOR_HEADS)
+    parser.add_argument("--predictor-type", choices=SUPPORTED_PREDICTOR_TYPES, default=DEFAULT_PREDICTOR_TYPE)
+    parser.add_argument("--model-size", choices=tuple(PREDICTOR_SIZE_PRESETS), default="base")
+    parser.add_argument("--predictor-dim", type=int, default=None)
+    parser.add_argument("--predictor-depth", type=int, default=None)
+    parser.add_argument("--predictor-heads", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -92,7 +98,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--no-progress", action="store_true")
     add_wandb_args(parser)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    args._output_dir_was_provided = "--output-dir" in argv or any(arg.startswith("--output-dir=") for arg in argv)
+    return args
 
 
 def default_device() -> str:
@@ -127,6 +135,7 @@ def build_model(args: argparse.Namespace) -> RCJepaACWorldModel:
         predictor_dim=args.predictor_dim,
         predictor_depth=args.predictor_depth,
         predictor_heads=args.predictor_heads,
+        predictor_type=args.predictor_type,
         dropout=args.dropout,
         auto_steps=args.auto_steps,
         strict_checkpoint=not args.allow_partial_checkpoint,
@@ -355,6 +364,8 @@ def save_checkpoint(
 def args_to_jsonable_dict(args: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in vars(args).items():
+        if key.startswith("_"):
+            continue
         if isinstance(value, Path):
             result[key] = str(value)
         else:
@@ -398,15 +409,57 @@ def load_resume_checkpoint(
     model: RCJepaACWorldModel,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    args: argparse.Namespace,
 ) -> dict[str, Any]:
     checkpoint = torch.load(resume_path, map_location=device)
+    validate_resume_predictor_config(checkpoint, args)
     model.predictor.load_state_dict(checkpoint["predictor_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
 
 
+def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.Namespace) -> None:
+    checkpoint_args = dict(checkpoint.get("args", {}))
+    checked_fields = (
+        "predictor_type",
+        "predictor_dim",
+        "predictor_depth",
+        "predictor_heads",
+        "dropout",
+    )
+    mismatches = []
+    for field in checked_fields:
+        if field not in checkpoint_args:
+            continue
+        current_value = getattr(args, field)
+        checkpoint_value = checkpoint_args[field]
+        if current_value != checkpoint_value:
+            mismatches.append(
+                {
+                    "field": field,
+                    "current": current_value,
+                    "checkpoint": checkpoint_value,
+                }
+            )
+    if mismatches:
+        raise ValueError(
+            "Resume checkpoint predictor config does not match current args. "
+            f"Mismatches: {mismatches}"
+        )
+
+
 def main() -> None:
     args = parse_args()
+    apply_predictor_size_preset(args)
+    if not args._output_dir_was_provided:
+        suffix_parts = []
+        if args.predictor_type != DEFAULT_PREDICTOR_TYPE:
+            suffix_parts.append(args.predictor_type)
+        if args.model_size != "base":
+            suffix_parts.append(args.model_size)
+        if suffix_parts:
+            args.output_dir = DEFAULT_OUTPUT_DIR.with_name(f"{DEFAULT_OUTPUT_DIR.name}_{'_'.join(suffix_parts)}")
+
     set_seed(args.seed)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -466,6 +519,7 @@ def main() -> None:
             model=model,
             optimizer=optimizer,
             device=device,
+            args=args,
         )
         start_epoch = int(resume_checkpoint["epoch"]) + 1
         best_val_loss = float(resume_checkpoint.get("best_val_loss", best_val_loss))

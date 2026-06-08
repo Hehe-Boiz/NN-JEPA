@@ -19,6 +19,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from data import settings
+from models.vjepa21_presets import (
+    DEFAULT_VJEPA21_FEATURE_PRESET,
+    VJEPA21_FEATURE_PRESETS,
+    vjepa21_feature_preset_options,
+)
 
 
 VIEWER_ROOT = Path(__file__).resolve().parents[1] / "viewer"
@@ -26,9 +31,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
-DEFAULT_VJEPA_CHECKPOINT = "checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt"
-DEFAULT_FEATURE_DIR = "data/processed/features/vjepa2_1_vitb_384_ema_fp32"
 MAX_JOB_LOG_LINES = 800
+PROGRESS_PREFIX = "__JOB_PROGRESS__ "
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,23 +152,21 @@ def build_preprocess_command() -> list[str]:
     ]
 
 
-def build_extract_feature_command(batch_size: int = 32, num_workers: int | None = None) -> list[str]:
+def build_extract_feature_command(
+    batch_size: int = 32,
+    num_workers: int | None = None,
+    encoder_preset: str = DEFAULT_VJEPA21_FEATURE_PRESET,
+) -> list[str]:
     command = [
         sys.executable,
         "-m",
         "tools.extract_vjepa_features",
         "--vjepa-root",
         "vjepa2",
-        "--vjepa-checkpoint",
-        DEFAULT_VJEPA_CHECKPOINT,
-        "--encoder",
-        "vit_base_384",
-        "--checkpoint-key",
-        "ema_encoder",
+        "--encoder-preset",
+        encoder_preset,
         "--manifest-dir",
         "data/processed/manifests",
-        "--output-dir",
-        DEFAULT_FEATURE_DIR,
         "--batch-size",
         str(batch_size),
         "--dtype",
@@ -184,13 +186,69 @@ def build_job_command(job_name: str, payload: dict[str, Any] | None = None) -> l
     if job_name == "extract_features":
         batch_size = int(payload.get("batch_size", 32))
         num_workers_value = payload.get("num_workers")
+        encoder_preset = str(payload.get("feature_preset") or DEFAULT_VJEPA21_FEATURE_PRESET)
         num_workers = None if num_workers_value in (None, "") else int(num_workers_value)
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         if num_workers is not None and num_workers < 0:
             raise ValueError("num_workers must be >= 0")
-        return build_extract_feature_command(batch_size=batch_size, num_workers=num_workers)
+        if encoder_preset not in VJEPA21_FEATURE_PRESETS:
+            available = ", ".join(VJEPA21_FEATURE_PRESETS)
+            raise ValueError(f"Unknown feature_preset={encoder_preset!r}. Available: {available}")
+        return build_extract_feature_command(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            encoder_preset=encoder_preset,
+        )
     raise ValueError(f"Unsupported job: {job_name}")
+
+
+def initial_progress(job_name: str) -> dict[str, Any]:
+    labels = {
+        "sync": "Starting Drive sync",
+        "preprocess": "Starting preprocessing",
+        "extract_features": "Starting feature extraction",
+    }
+    return {
+        "percent": 0.0,
+        "label": labels.get(job_name, "Starting job"),
+        "current": None,
+        "total": None,
+        "indeterminate": True,
+    }
+
+
+def completed_progress(status: str) -> dict[str, Any]:
+    if status == "completed":
+        return {
+            "percent": 100.0,
+            "label": "Completed",
+            "current": None,
+            "total": None,
+            "indeterminate": False,
+        }
+    return {
+        "percent": 0.0,
+        "label": "Failed",
+        "current": None,
+        "total": None,
+        "indeterminate": False,
+    }
+
+
+def parse_progress_line(line: str) -> dict[str, Any] | None:
+    if not line.startswith(PROGRESS_PREFIX):
+        return None
+    try:
+        payload = json.loads(line[len(PROGRESS_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    percent = payload.get("percent")
+    if percent is not None:
+        payload["percent"] = max(0.0, min(float(percent), 100.0))
+    return payload
 
 
 class JobRunner:
@@ -216,6 +274,7 @@ class JobRunner:
                 "finished_at": None,
                 "exit_code": None,
                 "log": deque(maxlen=MAX_JOB_LOG_LINES),
+                "progress": initial_progress(job_name),
             }
             self._append_log_locked(f"$ {' '.join(command)}")
 
@@ -265,15 +324,21 @@ class JobRunner:
                     self._process = process
             assert process.stdout is not None
             for line in process.stdout:
+                clean_line = line.rstrip()
+                progress = parse_progress_line(clean_line)
                 with self._lock:
                     if self._job is not None and self._job["id"] == job_id:
-                        self._append_log_locked(line.rstrip())
+                        if progress is not None:
+                            self._job["progress"] = progress
+                        else:
+                            self._append_log_locked(clean_line)
             exit_code = process.wait()
             with self._lock:
                 if self._job is not None and self._job["id"] == job_id:
                     self._job["exit_code"] = exit_code
                     self._job["finished_at"] = time.time()
                     self._job["status"] = "completed" if exit_code == 0 else "failed"
+                    self._job["progress"] = completed_progress(self._job["status"])
                     self._append_log_locked(f"Job finished with exit code {exit_code}.")
                     self._process = None
         except Exception as exc:  # pragma: no cover - defensive guard for server runtime.
@@ -282,6 +347,7 @@ class JobRunner:
                     self._job["exit_code"] = None
                     self._job["finished_at"] = time.time()
                     self._job["status"] = "failed"
+                    self._job["progress"] = completed_progress("failed")
                     self._append_log_locked(f"Job failed before process start: {exc}")
                     self._process = None
 
@@ -331,6 +397,9 @@ class SessionViewerHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/jobs":
                 self._send_json(JOB_RUNNER.snapshot(), include_body)
+                return
+            if path == "/api/feature-presets":
+                self._send_json({"presets": vjepa21_feature_preset_options()}, include_body)
                 return
             if path.startswith("/media/"):
                 self._serve_media(path, include_body)

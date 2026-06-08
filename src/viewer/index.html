@@ -31,6 +31,12 @@
           <h2>Data Ops</h2>
           <button id="syncDriveButton" type="button">Sync Drive</button>
           <button id="preprocessButton" type="button">Preprocess</button>
+          <label class="extract-preset-field">
+            Feature model
+            <select id="featurePresetSelect">
+              <option value="vitb_384">V-JEPA 2.1 ViT-B/16 384</option>
+            </select>
+          </label>
           <div class="extract-grid">
             <label>
               Feature batch
@@ -45,6 +51,15 @@
           <button id="cancelJobButton" class="secondary" type="button">Cancel Running Job</button>
           <div class="job-status">
             <strong>Status:</strong> <span id="jobStatus">idle</span>
+          </div>
+          <div class="job-progress" aria-label="Job progress">
+            <div class="job-progress-top">
+              <span id="jobProgressLabel">No job running</span>
+              <span id="jobProgressText">0%</span>
+            </div>
+            <div class="job-progress-track">
+              <div id="jobProgressFill" class="job-progress-fill"></div>
+            </div>
           </div>
         </section>
 

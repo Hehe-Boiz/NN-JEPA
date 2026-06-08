@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +20,11 @@ from data.feature_sequence_dataset import create_ac_feature_sequence_dataloaders
 from data.normalization import normalizer_to_dict
 from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS
 from models.rc_jepa_ac import (
-    DEFAULT_PREDICTOR_DEPTH,
-    DEFAULT_PREDICTOR_DIM,
-    DEFAULT_PREDICTOR_HEADS,
-    SimpleACPredictor,
+    DEFAULT_PREDICTOR_TYPE,
+    PREDICTOR_SIZE_PRESETS,
+    SUPPORTED_PREDICTOR_TYPES,
+    apply_predictor_size_preset,
+    build_ac_predictor,
     compute_world_model_losses,
     count_trainable_parameters,
 )
@@ -61,7 +63,8 @@ DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb
 DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_vitb_features_20260607")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description="Train RC JEPA-AC predictor from cached V-JEPA features.")
     parser.add_argument("--features-dir", type=Path, default=DEFAULT_FEATURES_DIR)
     parser.add_argument("--manifest-dir", type=Path, default=settings.MANIFEST_DIR)
@@ -70,9 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-frames-per-sample", type=int, default=settings.AC_RAW_FRAMES_PER_SAMPLE)
     parser.add_argument("--sequence-stride", type=int, default=settings.AC_SEQUENCE_STRIDE)
     parser.add_argument("--auto-steps", type=int, default=settings.AC_AUTO_STEPS)
-    parser.add_argument("--predictor-dim", type=int, default=DEFAULT_PREDICTOR_DIM)
-    parser.add_argument("--predictor-depth", type=int, default=DEFAULT_PREDICTOR_DEPTH)
-    parser.add_argument("--predictor-heads", type=int, default=DEFAULT_PREDICTOR_HEADS)
+    parser.add_argument("--predictor-type", choices=SUPPORTED_PREDICTOR_TYPES, default=DEFAULT_PREDICTOR_TYPE)
+    parser.add_argument("--model-size", choices=tuple(PREDICTOR_SIZE_PRESETS), default="base")
+    parser.add_argument("--predictor-dim", type=int, default=None)
+    parser.add_argument("--predictor-depth", type=int, default=None)
+    parser.add_argument("--predictor-heads", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -91,7 +96,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--no-progress", action="store_true")
     add_wandb_args(parser)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    args._output_dir_was_provided = "--output-dir" in argv or any(arg.startswith("--output-dir=") for arg in argv)
+    return args
 
 
 def default_device() -> str:
@@ -109,8 +116,9 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_predictor(args: argparse.Namespace, tokens_per_frame: int, embed_dim: int) -> SimpleACPredictor:
-    return SimpleACPredictor(
+def build_predictor(args: argparse.Namespace, tokens_per_frame: int, embed_dim: int) -> nn.Module:
+    return build_ac_predictor(
+        predictor_type=args.predictor_type,
         latent_dim=embed_dim,
         state_dim=len(args.state_columns),
         action_dim=len(args.action_columns),
@@ -240,6 +248,8 @@ def collect_normalization_metadata(dataset: Any) -> dict[str, Any]:
 def args_to_jsonable_dict(args: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in vars(args).items():
+        if key.startswith("_"):
+            continue
         if isinstance(value, Path):
             result[key] = str(value)
         else:
@@ -273,7 +283,7 @@ def epoch_wandb_metrics(
 
 def save_checkpoint(
     path: Path,
-    predictor: SimpleACPredictor,
+    predictor: nn.Module,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: LambdaLR | None,
     epoch: int,
@@ -312,14 +322,46 @@ def save_checkpoint(
 
 def load_resume_checkpoint(
     resume_path: Path,
-    predictor: SimpleACPredictor,
+    predictor: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    args: argparse.Namespace,
 ) -> dict[str, Any]:
     checkpoint = torch.load(resume_path, map_location=device)
+    validate_resume_predictor_config(checkpoint, args)
     predictor.load_state_dict(checkpoint["predictor_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
+
+
+def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.Namespace) -> None:
+    checkpoint_args = dict(checkpoint.get("args", {}))
+    checked_fields = (
+        "predictor_type",
+        "predictor_dim",
+        "predictor_depth",
+        "predictor_heads",
+        "dropout",
+    )
+    mismatches = []
+    for field in checked_fields:
+        if field not in checkpoint_args:
+            continue
+        current_value = getattr(args, field)
+        checkpoint_value = checkpoint_args[field]
+        if current_value != checkpoint_value:
+            mismatches.append(
+                {
+                    "field": field,
+                    "current": current_value,
+                    "checkpoint": checkpoint_value,
+                }
+            )
+    if mismatches:
+        raise ValueError(
+            "Resume checkpoint predictor config does not match current args. "
+            f"Mismatches: {mismatches}"
+        )
 
 
 def maybe_cleanup_cuda() -> None:
@@ -327,8 +369,20 @@ def maybe_cleanup_cuda() -> None:
         torch.cuda.empty_cache()
 
 
-def main() -> None:
-    args = parse_args()
+def main(args: argparse.Namespace | None = None) -> None:
+    args = parse_args() if args is None else args
+    apply_predictor_size_preset(args)
+    if not getattr(args, "_output_dir_was_provided", False):
+        suffix_parts = []
+        if args.predictor_type != DEFAULT_PREDICTOR_TYPE:
+            suffix_parts.append(args.predictor_type)
+        if args.model_size != "base":
+            suffix_parts.append(args.model_size)
+        if suffix_parts:
+            args.output_dir = DEFAULT_OUTPUT_DIR.with_name(
+                f"{DEFAULT_OUTPUT_DIR.name}_{'_'.join(suffix_parts)}"
+            )
+
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     epochs_dir = args.output_dir / "epochs"
@@ -392,7 +446,7 @@ def main() -> None:
     resume_checkpoint: dict[str, Any] | None = None
     if args.resume_from is not None:
         resumed_from = args.resume_from
-        resume_checkpoint = load_resume_checkpoint(args.resume_from, predictor, optimizer, device)
+        resume_checkpoint = load_resume_checkpoint(args.resume_from, predictor, optimizer, device, args)
         resume_phase = str(resume_checkpoint.get("phase", "epoch_complete"))
         if resume_phase == "train_complete_waiting_val":
             start_epoch = int(resume_checkpoint["epoch"])

@@ -7,15 +7,20 @@ from unittest import mock
 
 from data import settings
 from tools.session_web_viewer import (
+    PROGRESS_PREFIX,
     build_extract_feature_command,
     build_job_command,
     build_preprocess_command,
     build_session_payload,
     build_sync_command,
+    completed_progress,
     collect_sessions,
     get_frames_dir,
+    initial_progress,
     list_frame_paths,
+    parse_progress_line,
 )
+from models.vjepa21_presets import vjepa21_feature_preset_options
 
 
 class SessionWebViewerTests(unittest.TestCase):
@@ -80,18 +85,25 @@ class SessionWebViewerTests(unittest.TestCase):
         sync_command = build_sync_command()
         preprocess_command = build_preprocess_command()
         feature_command = build_extract_feature_command(batch_size=16, num_workers=2)
+        vitl_feature_command = build_extract_feature_command(
+            batch_size=8,
+            num_workers=1,
+            encoder_preset="vitl_384",
+        )
 
         self.assertIn("tools.sync_drive_data", sync_command)
         self.assertIn("--check-zips", sync_command)
         self.assertNotIn("--preprocess", sync_command)
         self.assertIn("tools.preprocess_data", preprocess_command)
         self.assertIn("tools.extract_vjepa_features", feature_command)
-        self.assertIn("--vjepa-checkpoint", feature_command)
-        self.assertIn("checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt", feature_command)
+        self.assertIn("--encoder-preset", feature_command)
+        self.assertIn("vitb_384", feature_command)
         self.assertIn("--batch-size", feature_command)
         self.assertIn("16", feature_command)
         self.assertIn("--num-workers", feature_command)
         self.assertIn("2", feature_command)
+        self.assertIn("vitl_384", vitl_feature_command)
+        self.assertIn("8", vitl_feature_command)
 
     def test_build_job_command_rejects_bad_feature_args(self) -> None:
         with self.assertRaises(ValueError):
@@ -103,7 +115,39 @@ class SessionWebViewerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_job_command("unknown")
 
+        with self.assertRaises(ValueError):
+            build_job_command("extract_features", {"feature_preset": "bad_preset"})
+
         self.assertIn("tools.preprocess_data", build_job_command("preprocess"))
+
+    def test_feature_preset_options_include_official_vjepa21_configs(self) -> None:
+        presets = {preset["name"]: preset for preset in vjepa21_feature_preset_options()}
+
+        self.assertEqual(presets["vitb_384"]["encoder_name"], "vit_base_384")
+        self.assertEqual(presets["vitb_384"]["checkpoint_key"], "ema_encoder")
+        self.assertEqual(presets["vitl_384"]["encoder_name"], "vit_large_384")
+        self.assertEqual(presets["vitg_384"]["checkpoint_key"], "target_encoder")
+        self.assertEqual(presets["vitG_384"]["encoder_name"], "vit_gigantic_384")
+
+    def test_progress_payload_helpers(self) -> None:
+        initial = initial_progress("sync")
+        completed = completed_progress("completed")
+        failed = completed_progress("failed")
+
+        self.assertTrue(initial["indeterminate"])
+        self.assertEqual(initial["percent"], 0.0)
+        self.assertEqual(completed["percent"], 100.0)
+        self.assertEqual(failed["label"], "Failed")
+
+    def test_parse_progress_line_accepts_only_marker_json(self) -> None:
+        payload = parse_progress_line(PROGRESS_PREFIX + '{"percent": 120, "label": "Extracting"}')
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["percent"], 100.0)
+        self.assertEqual(payload["label"], "Extracting")
+        self.assertIsNone(parse_progress_line('{"percent": 50}'))
+        self.assertIsNone(parse_progress_line(PROGRESS_PREFIX + "not json"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+defaults:
+  - experiment: rc_jepa_tiny
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/hydra/${now:%Y%m%d_%H%M%S}
+  output_subdir: null

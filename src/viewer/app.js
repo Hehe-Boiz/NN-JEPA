@@ -15,11 +15,15 @@ const syncDriveButton = document.getElementById("syncDriveButton");
 const preprocessButton = document.getElementById("preprocessButton");
 const extractFeaturesButton = document.getElementById("extractFeaturesButton");
 const cancelJobButton = document.getElementById("cancelJobButton");
+const featurePresetSelect = document.getElementById("featurePresetSelect");
 const featureBatchInput = document.getElementById("featureBatchInput");
 const featureWorkersInput = document.getElementById("featureWorkersInput");
 const jobStatus = document.getElementById("jobStatus");
 const jobName = document.getElementById("jobName");
 const jobLog = document.getElementById("jobLog");
+const jobProgressLabel = document.getElementById("jobProgressLabel");
+const jobProgressText = document.getElementById("jobProgressText");
+const jobProgressFill = document.getElementById("jobProgressFill");
 
 const state = {
   source: "raw",
@@ -221,8 +225,28 @@ function setJobButtonsEnabled(running) {
   preprocessButton.disabled = running;
   extractFeaturesButton.disabled = running;
   cancelJobButton.disabled = !running;
+  featurePresetSelect.disabled = running;
   featureBatchInput.disabled = running;
   featureWorkersInput.disabled = running;
+}
+
+function renderJobProgress(progress) {
+  if (!progress) {
+    jobProgressLabel.textContent = "No job running";
+    jobProgressText.textContent = "0%";
+    jobProgressFill.style.width = "0%";
+    jobProgressFill.classList.remove("indeterminate");
+    return;
+  }
+
+  const percent = Math.max(0, Math.min(Number(progress.percent) || 0, 100));
+  const hasCount = Number.isFinite(progress.current) && Number.isFinite(progress.total) && progress.total > 0;
+  const countText = hasCount ? ` (${progress.current}/${progress.total})` : "";
+  const indeterminate = Boolean(progress.indeterminate);
+  jobProgressLabel.textContent = `${progress.label || "Working"}${countText}`;
+  jobProgressText.textContent = `${percent.toFixed(0)}%`;
+  jobProgressFill.style.width = indeterminate ? "35%" : `${percent}%`;
+  jobProgressFill.classList.toggle("indeterminate", indeterminate);
 }
 
 function renderJob(payload) {
@@ -231,6 +255,7 @@ function renderJob(payload) {
     jobStatus.textContent = "idle";
     jobName.textContent = "No job";
     jobLog.textContent = "No job has run yet.";
+    renderJobProgress(null);
     setJobButtonsEnabled(false);
     return;
   }
@@ -240,6 +265,7 @@ function renderJob(payload) {
   jobName.textContent = `${job.name} #${job.id}`;
   jobLog.textContent = job.log.length > 0 ? job.log.join("\n") : "Waiting for output...";
   jobLog.scrollTop = jobLog.scrollHeight;
+  renderJobProgress(job.progress);
   setJobButtonsEnabled(running);
 
   if (state.lastJobStatus === "running" && job.status === "completed" && (job.name === "sync" || job.name === "preprocess")) {
@@ -271,6 +297,25 @@ async function startJob(job, payload = {}) {
   ensureJobPolling();
 }
 
+async function loadFeaturePresets() {
+  const payload = await fetchJson("/api/feature-presets");
+  if (!Array.isArray(payload.presets) || payload.presets.length === 0) {
+    return;
+  }
+  const currentValue = featurePresetSelect.value;
+  featurePresetSelect.innerHTML = "";
+  for (const preset of payload.presets) {
+    const option = document.createElement("option");
+    option.value = preset.name;
+    option.textContent = preset.label;
+    option.title = `${preset.encoder_name}, ${preset.checkpoint_key}, ${preset.default_output_dir}`;
+    featurePresetSelect.appendChild(option);
+  }
+  if ([...featurePresetSelect.options].some((option) => option.value === currentValue)) {
+    featurePresetSelect.value = currentValue;
+  }
+}
+
 syncDriveButton.addEventListener("click", () => {
   startJob("sync").catch(showError);
 });
@@ -283,6 +328,7 @@ extractFeaturesButton.addEventListener("click", () => {
   const batchSize = Math.max(1, Number.parseInt(featureBatchInput.value, 10) || 32);
   const numWorkers = Math.max(0, Number.parseInt(featureWorkersInput.value, 10) || 0);
   startJob("extract_features", {
+    feature_preset: featurePresetSelect.value,
     batch_size: batchSize,
     num_workers: numWorkers,
   }).catch(showError);
@@ -295,5 +341,6 @@ cancelJobButton.addEventListener("click", () => {
 });
 
 loadSessions().catch(showError);
+loadFeaturePresets().catch(showError);
 refreshJob().catch(showError);
 ensureJobPolling();

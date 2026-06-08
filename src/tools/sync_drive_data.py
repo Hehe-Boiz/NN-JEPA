@@ -22,6 +22,7 @@ SESSION_ZIP_PATTERN = "session_*.zip"
 SOURCE_SIGNATURE_NAME = ".source_zip_signature.json"
 DEFAULT_TRANSFERS = 8
 DEFAULT_CHECKERS = 16
+PROGRESS_PREFIX = "__JOB_PROGRESS__ "
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +68,30 @@ def run_command(command: list[str], *, env: dict[str, str] | None = None, dry_ru
     subprocess.run(command, check=True, env=env)
 
 
+def print_progress(
+    percent: float,
+    label: str,
+    *,
+    current: int | None = None,
+    total: int | None = None,
+    indeterminate: bool = False,
+) -> None:
+    print(
+        PROGRESS_PREFIX
+        + json.dumps(
+            {
+                "percent": max(0.0, min(float(percent), 100.0)),
+                "label": label,
+                "current": current,
+                "total": total,
+                "indeterminate": indeterminate,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def rclone_common_args(args: argparse.Namespace) -> list[str]:
     common = [
         "--transfers",
@@ -82,6 +107,7 @@ def rclone_common_args(args: argparse.Namespace) -> list[str]:
 
 def sync_zip_staging(args: argparse.Namespace) -> None:
     args.zip_staging_dir.mkdir(parents=True, exist_ok=True)
+    print_progress(5, "Downloading zip files from Drive", indeterminate=True)
     command = [
         args.rclone_bin,
         "copy",
@@ -92,10 +118,12 @@ def sync_zip_staging(args: argparse.Namespace) -> None:
         *rclone_common_args(args),
     ]
     run_command(command, dry_run=args.dry_run)
+    print_progress(25, "Drive zip download step finished")
 
 
 def sync_extra_nonzip_staging(args: argparse.Namespace) -> None:
     args.extra_nonzip_staging_dir.mkdir(parents=True, exist_ok=True)
+    print_progress(25, "Downloading non-zip Drive files", indeterminate=True)
     command = [
         args.rclone_bin,
         "copy",
@@ -106,9 +134,11 @@ def sync_extra_nonzip_staging(args: argparse.Namespace) -> None:
         *rclone_common_args(args),
     ]
     run_command(command, dry_run=args.dry_run)
+    print_progress(35, "Non-zip Drive download step finished")
 
 
 def check_zip_staging(args: argparse.Namespace) -> None:
+    print_progress(35, "Checking local zip staging against Drive", indeterminate=True)
     command = [
         args.rclone_bin,
         "check",
@@ -121,6 +151,7 @@ def check_zip_staging(args: argparse.Namespace) -> None:
     if not args.no_fast_list:
         command.append("--fast-list")
     run_command(command, dry_run=args.dry_run)
+    print_progress(45, "Drive zip check finished")
 
 
 def zip_signature(zip_path: Path) -> dict[str, Any]:
@@ -203,7 +234,18 @@ def extract_top_level_zips(args: argparse.Namespace) -> dict[str, list[str]]:
         "changed_skipped": [],
         "dry_run": [],
     }
-    for zip_path in sorted(args.zip_staging_dir.glob(SESSION_ZIP_PATTERN)):
+    zip_paths = sorted(args.zip_staging_dir.glob(SESSION_ZIP_PATTERN))
+    total = len(zip_paths)
+    if total == 0:
+        print_progress(60, "No top-level session zip found", current=0, total=0)
+        return summary
+    for index, zip_path in enumerate(zip_paths, start=1):
+        print_progress(
+            45 + 25 * ((index - 1) / max(total, 1)),
+            f"Extracting/adopting sessions: {zip_path.stem}",
+            current=index - 1,
+            total=total,
+        )
         status = extract_session_zip(
             zip_path,
             args.raw_dir,
@@ -211,6 +253,7 @@ def extract_top_level_zips(args: argparse.Namespace) -> dict[str, list[str]]:
             dry_run=args.dry_run,
         )
         summary.setdefault(status, []).append(zip_path.stem)
+    print_progress(70, "Session zip extraction step finished", current=total, total=total)
     return summary
 
 
@@ -241,24 +284,39 @@ def run_sensor_sync(args: argparse.Namespace, extract_summary: dict[str, list[st
     )
 
     synced: list[str] = []
-    for session_dir in targets:
+    total = len(targets)
+    if total == 0:
+        print_progress(90, "No session needs sensor sync", current=0, total=0)
+        return synced
+    for index, session_dir in enumerate(targets, start=1):
+        print_progress(
+            70 + 20 * ((index - 1) / max(total, 1)),
+            f"Running sensor sync: {session_dir.name}",
+            current=index - 1,
+            total=total,
+        )
         command = [sys.executable, "-m", "jepa_wm.data.sync", str(session_dir)]
         run_command(command, env=env, dry_run=args.dry_run)
         synced.append(session_dir.name)
+    print_progress(90, "Sensor sync step finished", current=total, total=total)
     return synced
 
 
 def run_preprocess(dry_run: bool) -> dict[str, Any] | None:
+    print_progress(90, "Running preprocessing after sync", indeterminate=True)
     print("+ preprocess_all_sessions()", flush=True)
     if dry_run:
         return None
     from data.preprocess import preprocess_all_sessions
 
-    return preprocess_all_sessions()
+    summary = preprocess_all_sessions()
+    print_progress(98, "Preprocessing after sync finished")
+    return summary
 
 
 def main() -> None:
     args = parse_args()
+    print_progress(0, "Starting Drive sync", indeterminate=True)
     if not args.skip_rclone_copy:
         sync_zip_staging(args)
     if args.sync_extra_nonzip:
@@ -285,6 +343,7 @@ def main() -> None:
         "preprocess": preprocess_summary,
     }
     print(json.dumps(final_summary, indent=2, ensure_ascii=False))
+    print_progress(100, "Drive sync complete")
 
 
 if __name__ == "__main__":

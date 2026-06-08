@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from data import settings
 from data.feature_sequence_dataset import create_ac_feature_sequence_dataloaders
-from models.rc_jepa_ac import SimpleACPredictor, build_rollout_state_context
+from models.rc_jepa_ac import build_rollout_state_context
 from tools.rc_jepa_ac_feature_runtime import (
     DEFAULT_FEATURES_DIR,
     FeaturePredictorConfig,
@@ -50,7 +51,7 @@ def maybe_cleanup_cuda() -> None:
 
 
 def predict_batch(
-    predictor: SimpleACPredictor,
+    predictor: nn.Module,
     latents: torch.Tensor,
     states: torch.Tensor,
     actions: torch.Tensor,

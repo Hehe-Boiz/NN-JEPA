@@ -8,14 +8,17 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image
 
 from . import settings
 
 
-def preprocess_all_sessions() -> dict[str, Any]:
+ProgressCallback = Callable[[int, int, str], None]
+
+
+def preprocess_all_sessions(progress_callback: ProgressCallback | None = None) -> dict[str, Any]:
     settings.make_output_dirs()
 
     session_dirs = find_session_dirs()
@@ -25,11 +28,16 @@ def preprocess_all_sessions() -> dict[str, Any]:
     session_samples: dict[str, list[dict[str, Any]]] = {}
     session_reports: list[dict[str, Any]] = []
 
-    for session_dir in session_dirs:
+    total_sessions = len(session_dirs)
+    for index, session_dir in enumerate(session_dirs, start=1):
+        if progress_callback is not None:
+            progress_callback(index - 1, total_sessions, f"Preprocessing {session_dir.name}")
         samples, report = preprocess_one_session(session_dir)
         session_reports.append(report)
         if samples:
             session_samples[session_dir.name] = samples
+    if progress_callback is not None:
+        progress_callback(total_sessions, total_sessions, "Writing manifests and report")
 
     if not session_samples:
         raise RuntimeError("No usable sample found after preprocessing")

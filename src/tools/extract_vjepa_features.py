@@ -21,15 +21,22 @@ from data.feature_sequence_dataset import FEATURE_METADATA_NAME, FEATURE_SESSION
 from data.sequence_dataset import sample_sort_key
 from models.rc_jepa_ac import (
     DEFAULT_CHECKPOINT_KEY,
-    DEFAULT_ENCODER_NAME,
     DEFAULT_PATCH_SIZE,
     FrozenVJepa21Encoder,
 )
+from models.vjepa21_presets import (
+    DEFAULT_VJEPA21_FEATURE_PRESET,
+    SUPPORTED_VJEPA21_ENCODER_NAMES,
+    VJEPA21_FEATURE_PRESETS,
+    get_vjepa21_feature_preset,
+    vjepa21_feature_output_dir,
+)
 
 
-DEFAULT_OUTPUT_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp32"
+DEFAULT_OUTPUT_DIR = vjepa21_feature_output_dir(DEFAULT_VJEPA21_FEATURE_PRESET, "fp32")
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = settings.NUM_WORKERS
+PROGRESS_PREFIX = "__JOB_PROGRESS__ "
 
 
 class FrameFeatureDataset(Dataset):
@@ -59,12 +66,18 @@ class FrameFeatureDataset(Dataset):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract frozen V-JEPA 2.1 frame features.")
     parser.add_argument("--manifest-dir", type=Path, default=settings.MANIFEST_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--encoder-preset",
+        default=DEFAULT_VJEPA21_FEATURE_PRESET,
+        choices=list(VJEPA21_FEATURE_PRESETS),
+        help="Safe preset that maps encoder/checkpoint key/checkpoint path/default feature dir.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--vjepa-root", type=Path, default=settings.REPO_ROOT / "vjepa2")
-    parser.add_argument("--vjepa-checkpoint", type=Path, required=True)
-    parser.add_argument("--checkpoint-key", default=DEFAULT_CHECKPOINT_KEY)
+    parser.add_argument("--vjepa-checkpoint", type=Path, default=None)
+    parser.add_argument("--checkpoint-key", default=None)
     parser.add_argument("--allow-partial-checkpoint", action="store_true")
-    parser.add_argument("--encoder", default=DEFAULT_ENCODER_NAME, choices=["vit_small_384", "vit_base_384", "vit_large_384"])
+    parser.add_argument("--encoder", default=None, choices=list(SUPPORTED_VJEPA21_ENCODER_NAMES))
     parser.add_argument("--image-size", type=int, default=settings.AC_IMAGE_SIZE)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--tubelet-size", type=int, default=settings.AC_TUBELET_SIZE)
@@ -76,6 +89,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def resolve_feature_extraction_args(args: argparse.Namespace) -> argparse.Namespace:
+    preset = get_vjepa21_feature_preset(args.encoder_preset)
+    encoder_was_overridden = args.encoder is not None and args.encoder != preset.encoder_name
+
+    if args.encoder is None:
+        args.encoder = preset.encoder_name
+    if args.vjepa_checkpoint is None:
+        if encoder_was_overridden:
+            raise ValueError(
+                "When --encoder overrides --encoder-preset, pass --vjepa-checkpoint explicitly "
+                "to avoid loading weights from the wrong architecture."
+            )
+        args.vjepa_checkpoint = preset.checkpoint_path
+    if args.checkpoint_key is None:
+        args.checkpoint_key = DEFAULT_CHECKPOINT_KEY if encoder_was_overridden else preset.checkpoint_key
+    if args.output_dir is None:
+        if encoder_was_overridden:
+            args.output_dir = settings.PROCESSED_DATA_DIR / "features" / f"{args.encoder}_{args.dtype}"
+        else:
+            args.output_dir = vjepa21_feature_output_dir(args.encoder_preset, args.dtype)
+
+    return args
 
 
 def default_device() -> str:
@@ -91,6 +128,30 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def print_progress(
+    percent: float,
+    label: str,
+    *,
+    current: int | None = None,
+    total: int | None = None,
+    indeterminate: bool = False,
+) -> None:
+    print(
+        PROGRESS_PREFIX
+        + json.dumps(
+            {
+                "percent": max(0.0, min(float(percent), 100.0)),
+                "label": label,
+                "current": current,
+                "total": total,
+                "indeterminate": indeterminate,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
 
 def load_unique_samples(manifest_dir: Path, splits: Sequence[str]) -> list[dict[str, Any]]:
@@ -304,7 +365,9 @@ def write_json(path: Path, payload: Any) -> None:
 
 def main() -> None:
     args = parse_args()
+    args = resolve_feature_extraction_args(args)
     set_seed(args.seed)
+    print_progress(0, "Preparing feature extraction", indeterminate=True)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     sessions_dir = args.output_dir / FEATURE_SESSIONS_DIR_NAME
@@ -324,6 +387,7 @@ def main() -> None:
         ):
             status_summary = cache_status_summary(grouped, sessions_dir, existing_metadata, dtype)
             if status_summary["compatible"] == len(grouped):
+                print_progress(100, "Feature cache already complete", current=len(grouped), total=len(grouped))
                 print(
                     json.dumps(
                         {
@@ -342,13 +406,16 @@ def main() -> None:
                 )
                 return
 
+    print_progress(5, "Loading frozen V-JEPA encoder", indeterminate=True)
     device = torch.device(args.device)
     encoder = build_encoder(args).to(device)
     encoder.eval()
+    print_progress(10, "Encoder loaded")
 
     metadata = {
         "format_version": 1,
         "feature_layout": "frame_tokens",
+        "encoder_preset": args.encoder_preset,
         "encoder_name": args.encoder,
         "checkpoint_path": str(args.vjepa_checkpoint),
         "checkpoint_key": args.checkpoint_key,
@@ -369,8 +436,15 @@ def main() -> None:
     print(json.dumps(metadata, indent=2), flush=True)
 
     feature_summary = {"extracted": 0, "skipped_compatible": 0}
+    total_sessions = len(grouped)
     with torch.no_grad():
-        for session_id, session_samples in tqdm(grouped.items(), desc="sessions"):
+        for index, (session_id, session_samples) in enumerate(tqdm(grouped.items(), desc="sessions"), start=1):
+            print_progress(
+                10 + 90 * ((index - 1) / max(total_sessions, 1)),
+                f"Extracting features: {session_id}",
+                current=index - 1,
+                total=total_sessions,
+            )
             status = extract_session_features(
                 session_id=session_id,
                 session_samples=session_samples,
@@ -383,6 +457,7 @@ def main() -> None:
                 overwrite=args.overwrite,
             )
             feature_summary[status] = feature_summary.get(status, 0) + 1
+    print_progress(100, "Feature extraction complete", current=total_sessions, total=total_sessions)
     print(json.dumps({"status": "feature_extraction_complete", "feature_summary": feature_summary}, indent=2), flush=True)
 
 

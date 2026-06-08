@@ -1,5 +1,196 @@
 # HANDOFF - NN-JEPA RC Car JEPA-AC
 
+## Cập nhật bàn giao - 2026-06-09
+
+Repo hiện tại là `NN-JEPA`, đây là repo train. Repo `JEPA/` chỉ dùng cho phần cứng/recorder/sync/staging. Không sửa code gốc trong `vjepa2/`.
+
+Tài liệu audit/báo cáo gần nhất:
+
+```text
+doc/full_audit_report_20260608.md
+doc/bao_cao_vjepa2_ac_vs_nn_jepa.md
+doc/bao_cao_kha_nang_dung_predictor_ac_official.md
+doc/bao_cao_trien_khai_official_lite_predictor.md
+```
+
+Kết quả audit mới nhất:
+
+```text
+official_lite predictor: pass shape/mask/RoPE/loss smoke
+action-block causal mask: khớp source vjepa2 cho case thật [4624, 4624]
+RoPE rotation: khớp source vjepa2, max diff = 0.0
+compileall: pass
+unit tests: 41/41 pass
+Hydra dry-run rc_jepa_official_lite_tiny: pass
+git diff --check: pass
+```
+
+Blocker hiện tại trước khi train thật:
+
+```text
+GPU/CUDA: nvidia-smi fail, chưa giao tiếp được NVIDIA driver
+feature cache ViT-B fp32: manifest có 100 session, cache mới có 63 json + 64 npy
+missing feature json sessions: 37
+partial feature: session_20260607_153652 có .npy nhưng thiếu .json
+```
+
+Việc cần làm ngay trước train: sửa GPU/driver, rồi chạy extract bù feature cache.
+
+`JEPA/` vừa kiểm tra sau khi pull:
+
+```text
+HEAD: be50793 Add visual navigation (TopoGraph subgoal) + control on current servo
+Thay đổi chính: visual navigation/topological graph, CEM planner, eval/viz navigation,
+config train vjepa_ac_towerpro.yaml và vjepa_ac_mixed.yaml cho servo hiện tại.
+Ảnh hưởng tới NN-JEPA: chưa ảnh hưởng trực tiếp; muốn dùng navigation/planning thì port riêng sau.
+```
+
+Trạng thái data/manifest hiện tại:
+
+```text
+data/raw: 100 session
+train: 84766 samples, 68139 windows
+val:   9470 samples, 8259 windows
+test:  20310 samples, 16138 windows
+feature cache path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
+feature cache files: 64 .npy + 63 .json
+feature metadata: 114546 frame, 576 token/frame, embed_dim 768, fp32
+missing_json_count: 37
+missing_npy_count: 36
+```
+
+Drive/staging đã audit trước đó:
+
+```text
+JEPA/data/drive_zips:
+  65 zip khớp Drive, 0 differences
+  63 zip top-level session_20260607_*.zip đã từng được dùng train trước khi có thêm data mới
+  2 zip cũ trong trong nhà/ staging-only, không train
+
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV:
+  28 session cũ 20260605
+  53403 file
+  actions_synced.csv / imu_synced.csv đủ 28/28
+  không đưa vào data/raw
+  không dùng train hiện tại
+```
+
+Data servo cũ đã được khôi phục thủ công từ 3 zip:
+
+```text
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV-20260608T112340Z-3-001.zip
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV-20260608T112340Z-3-002.zip
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV-20260608T112340Z-3-003.zip
+```
+
+Sau giải nén, session `session_20260605_155710` thiếu synced; đã chạy lại `jepa_wm.data.sync`, kết quả giữ `47`, bỏ `1`, `offset=100ms +imu`.
+
+Web viewer hiện có 3 job riêng:
+
+```text
+Sync Drive: kéo zip mới, extract top-level session, chạy sensor sync; không preprocess
+Preprocess: chạy tools.preprocess_data
+Extract V-JEPA Features: chạy tools.extract_vjepa_features
+```
+
+Web viewer có thanh tiến trình trong panel `Data Ops`:
+
+- `Sync Drive`: progress theo stage; byte-level/tốc độ tải của `rclone -P` nằm trong `Job Log`.
+- `Preprocess`: progress theo số session đã xử lý.
+- `Extract V-JEPA Features`: có dropdown `Feature model`, progress theo số session đã extract/skip; nếu cache đủ thì báo 100% ngay.
+
+Feature extractor có preset V-JEPA 2.1:
+
+```text
+vitb_384 -> vit_base_384, checkpoint_key=ema_encoder, output vjepa2_1_vitb_384_ema_<dtype>
+vitl_384 -> vit_large_384, checkpoint_key=ema_encoder, output vjepa2_1_vitl_384_ema_<dtype>
+vitg_384 -> vit_giant_384, checkpoint_key=target_encoder, output vjepa2_1_vitg_384_target_<dtype>
+vitG_384 -> vit_gigantic_384, checkpoint_key=target_encoder, output vjepa2_1_vitG_384_target_<dtype>
+```
+
+Lệnh extract nên dùng preset:
+
+```bash
+PYTHONPATH=src python3 -m tools.extract_vjepa_features \
+  --vjepa-root vjepa2 \
+  --encoder-preset vitb_384 \
+  --manifest-dir data/processed/manifests \
+  --batch-size 32 \
+  --dtype fp32
+```
+
+Nếu đổi preset encoder thì phải train predictor lại với đúng feature dir mới.
+
+Chạy web:
+
+```bash
+conda activate nn-jepa
+PYTHONPATH=src python3 -m tools.session_web_viewer
+```
+
+Mở:
+
+```text
+http://127.0.0.1:8765
+```
+
+Feature extractor đã có fast-skip:
+
+```text
+nếu session cache đúng shape/dtype -> skip session
+nếu toàn bộ cache đầy đủ + metadata khớp -> kết thúc sớm, không load encoder/checkpoint
+hiện cache chưa đầy đủ vì thiếu 37 session theo manifest mới
+```
+
+Default quan trọng:
+
+```text
+feature cache: data/processed/features/vjepa2_1_vitb_384_ema_fp32
+feature train output: checkpoints/rc_jepa_ac_vitb_features_20260607
+eval/infer default checkpoint: checkpoints/rc_jepa_ac_vitb_features_20260607/best.pt
+V-JEPA checkpoint: checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt
+encoder: vit_base_384
+checkpoint key: ema_encoder
+```
+
+Predictor hiện tại có 2 loại:
+
+```text
+simple: baseline cũ, mặc định
+official_lite: predictor mới theo hướng V-JEPA AC official-lite
+```
+
+Chọn bằng:
+
+```bash
+--predictor-type simple
+--predictor-type official_lite
+```
+
+Preset predictor hiện tại với ViT-B 384 feature:
+
+```text
+simple tiny:          predictor_dim=128, depth=2, heads=4, params=670,464
+simple small:         predictor_dim=256, depth=4, heads=4, params=3,706,112
+simple base:          predictor_dim=512, depth=6, heads=8, params=20,007,680
+official_lite tiny:   predictor_dim=128, depth=2, heads=4, params=595,456
+official_lite small:  predictor_dim=256, depth=4, heads=4, params=3,556,096
+official_lite base:   predictor_dim=512, depth=6, heads=8, params=19,707,648
+```
+
+`simple base` vẫn là mặc định. `tiny` dùng `--model-size tiny` để thử pipeline nhanh. `official_lite tiny` nên chạy batch nhỏ hơn, ví dụ `batch_size=4`, `eval_batch_size=1`.
+
+Kiểm tra gần nhất:
+
+```text
+compileall: pass
+unit tests: 41/41 pass
+Hydra official_lite dry-run: pass
+official_lite full-token smoke loss: pass
+web smoke test: /, /app.js, /styles.css, /api/sessions, /api/jobs đều HTTP 200
+rclone/session_web_viewer process nền: không còn
+```
+
 ## Mục tiêu hiện tại
 
 Dự án đang xây world model kiểu JEPA/V-JEPA cho xe RC tự lái trong nhà.
@@ -133,7 +324,9 @@ Nó gồm:
 
 ```text
 FrozenVJepa21Encoder
-SimpleACPredictor
+predictor chọn bằng predictor_type:
+  simple -> SimpleACPredictor
+  official_lite -> VJepaStyleACPredictor
 ```
 
 Encoder:
@@ -146,13 +339,22 @@ Encoder:
 - Chạy `torch.no_grad()`.
 - Chỉ dùng để tạo latent target.
 
-Predictor:
+Predictor `simple`:
 
 - Causal transformer nhỏ.
 - Nhận latent tokens.
 - Nhận action token.
 - Nhận state token.
 - Là phần duy nhất được train.
+
+Predictor `official_lite`:
+
+- Bám source V-JEPA AC hơn `simple`.
+- Token layout là `[action, state, patch tokens]`.
+- Dùng action-block causal attention mask giống source `vjepa2`.
+- Dùng RoPE attention frame/height/width.
+- Output vẫn là latent patch tokens.
+- Không phải exact official reproduction vì state/action RC là 5D/2D, còn DROID official là 7D/7D.
 
 Loss:
 
@@ -214,18 +416,84 @@ Nếu cần debug checkpoint mismatch:
 --allow-partial-checkpoint
 ```
 
-## Trạng thái kiểm tra
-
-Đã chạy:
+Lệnh train khuyến nghị hiện tại là train predictor từ feature cache:
 
 ```bash
-python3 -m compileall src tests
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
+  --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --manifest-dir data/processed/manifests \
+  --output-dir checkpoints/rc_jepa_ac_vitb_features_20260607 \
+  --epochs 100 \
+  --batch-size 10 \
+  --eval-batch-size 2 \
+  --num-workers 8 \
+  --lr 1e-4 \
+  --warmup-epochs 4 \
+  --warmup-start-factor 0.1 \
+  --min-lr-ratio 0.1 \
+  --early-stopping-patience 15 \
+  --wandb-project nn-jepa-rc
 ```
 
-Kết quả pass.
+Lệnh train `tiny` để thử nhanh:
 
-Lưu ý: môi trường shell lúc đó chưa có `torch`, nên test tensor/model bị skip. Code mới vẫn import torch trực tiếp, không có fallback.
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
+  --model-size tiny \
+  --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --manifest-dir data/processed/manifests \
+  --output-dir checkpoints/rc_jepa_ac_vitb_features_20260607_tiny \
+  --epochs 20 \
+  --batch-size 10 \
+  --eval-batch-size 2 \
+  --num-workers 8 \
+  --lr 1e-4 \
+  --warmup-epochs 2 \
+  --early-stopping-patience 5 \
+  --wandb-project nn-jepa-rc \
+  --wandb-tags tiny
+```
+
+Lệnh train `official_lite tiny` để thử predictor gần source V-JEPA AC hơn:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
+  --predictor-type official_lite \
+  --model-size tiny \
+  --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --manifest-dir data/processed/manifests \
+  --output-dir checkpoints/rc_jepa_ac_vitb_features_20260607_official_lite_tiny \
+  --epochs 20 \
+  --batch-size 4 \
+  --eval-batch-size 1 \
+  --num-workers 8 \
+  --lr 1e-4 \
+  --warmup-epochs 2 \
+  --early-stopping-patience 5 \
+  --wandb-project nn-jepa-rc \
+  --wandb-tags official_lite tiny
+```
+
+Hydra equivalent:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_official_lite_tiny
+```
+
+## Trạng thái kiểm tra
+
+Đã chạy gần nhất:
+
+```bash
+python -m compileall src tests
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+Kết quả: `41/41` pass. Torch đang dùng trực tiếp, không có fallback import.
 
 ## Cập nhật mới nhất cần nhớ
 
@@ -237,12 +505,12 @@ Các lỗi logic train đã được sửa:
 - Checkpoint train lưu metadata normalization để inference dùng lại đúng scale.
 - Outlier robust đang bật bằng `REMOVE_SIMPLE_OUTLIERS = True`.
 
-Manifest mới sau preprocess:
+Manifest hiện tại sau preprocess:
 
 ```text
-train: 29195 samples
-val:    6484 samples
-test:   13579 samples
+train: 84766 samples, 68139 windows
+val:   9470 samples, 8259 windows
+test:  20310 samples, 16138 windows
 ```
 
 Report:
@@ -266,13 +534,17 @@ Tắt bằng:
 
 ## Việc cần làm tiếp
 
-1. Dùng môi trường có `torch`.
-2. Chạy preprocessing nếu chưa có manifest.
-3. Chuẩn bị checkpoint V-JEPA 2.1.
-4. Chạy smoke train 1 epoch với batch nhỏ.
-5. Kiểm tra `run_config.json`, `history.json`, `test_metrics.json`.
-6. Xác nhận encoder freeze và chỉ predictor update.
-7. Sau khi world model loss ổn, thêm planner/MPC hoặc policy head để chọn action.
+1. Sửa GPU/driver trước, vì `nvidia-smi` đang fail.
+2. Chạy extract bù feature cache ViT-B fp32; hiện manifest có 100 session nhưng cache thiếu 37 `.json`.
+3. Nếu Drive có data mới: mở web và bấm `Sync Drive`, theo dõi progress/log.
+4. Kiểm tra session mới trong viewer.
+5. Bấm `Preprocess` để rebuild manifest, theo dõi progress theo session.
+6. Chọn `Feature model`, rồi bấm `Extract V-JEPA Features`; cache đúng thì skip, session mới thì extract.
+7. Train thử predictor `simple tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type simple --model-size tiny`.
+8. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
+9. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
+10. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
+11. Sau khi world model loss ổn, thêm planner/MPC hoặc policy head để chọn action.
 
 ## Ràng buộc cần nhớ
 

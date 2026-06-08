@@ -19,7 +19,16 @@ if TORCH_AVAILABLE:
 
     from data.feature_sequence_dataset import RCJepaACFeatureSequenceDataset
     from data.sequence_dataset import RCJepaACSequenceDataset, build_sequence_windows
-    from models.rc_jepa_ac import SimpleACPredictor, build_rollout_state_context, compute_world_model_losses
+    from models.rc_jepa_ac import (
+        SimpleACPredictor,
+        VJepaStyleACPredictor,
+        apply_predictor_size_preset,
+        build_ac_predictor,
+        build_action_block_causal_attention_mask,
+        build_rollout_state_context,
+        compute_world_model_losses,
+    )
+    from tools.extract_vjepa_features import resolve_feature_extraction_args
     from tools.rc_jepa_ac_feature_runtime import config_from_checkpoint
     from tools.train_rc_jepa_ac import (
         build_lr_scheduler,
@@ -152,6 +161,134 @@ class RCJepaACTests(unittest.TestCase):
         prediction = predictor(latents, actions, states)
 
         self.assertEqual(tuple(prediction.shape), (2, 3 * 4, 8))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_official_lite_predictor_keeps_latent_shape(self) -> None:
+        predictor = VJepaStyleACPredictor(
+            latent_dim=8,
+            state_dim=5,
+            action_dim=2,
+            tokens_per_frame=4,
+            max_frames=4,
+            predictor_dim=64,
+            depth=1,
+            num_heads=4,
+        )
+        latents = torch.randn(2, 3 * 4, 8)
+        actions = torch.randn(2, 3, 2)
+        states = torch.randn(2, 3, 5)
+
+        prediction = predictor(latents, actions, states)
+
+        self.assertEqual(tuple(prediction.shape), (2, 3 * 4, 8))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_official_lite_mask_allows_only_current_and_past_frames(self) -> None:
+        mask = build_action_block_causal_attention_mask(
+            num_frames=3,
+            grid_height=2,
+            grid_width=2,
+            add_tokens=2,
+        )
+        tokens_per_step = 6
+
+        self.assertTrue(bool(mask[0, 0]))
+        self.assertFalse(bool(mask[0, tokens_per_step]))
+        self.assertTrue(bool(mask[tokens_per_step, 0]))
+        self.assertTrue(bool(mask[tokens_per_step, tokens_per_step]))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_predictor_factory_selects_simple_or_official_lite(self) -> None:
+        simple = build_ac_predictor(
+            predictor_type="simple",
+            latent_dim=8,
+            state_dim=5,
+            action_dim=2,
+            tokens_per_frame=4,
+            max_frames=4,
+            predictor_dim=16,
+            depth=1,
+            num_heads=4,
+        )
+        official_lite = build_ac_predictor(
+            predictor_type="official_lite",
+            latent_dim=8,
+            state_dim=5,
+            action_dim=2,
+            tokens_per_frame=4,
+            max_frames=4,
+            predictor_dim=64,
+            depth=1,
+            num_heads=4,
+        )
+
+        self.assertIsInstance(simple, SimpleACPredictor)
+        self.assertIsInstance(official_lite, VJepaStyleACPredictor)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_predictor_size_preset_fills_missing_values(self) -> None:
+        args = SimpleNamespace(
+            model_size="tiny",
+            predictor_dim=None,
+            predictor_depth=None,
+            predictor_heads=None,
+        )
+
+        apply_predictor_size_preset(args)
+
+        self.assertEqual(args.predictor_dim, 128)
+        self.assertEqual(args.predictor_depth, 2)
+        self.assertEqual(args.predictor_heads, 4)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_predictor_size_preset_keeps_manual_override(self) -> None:
+        args = SimpleNamespace(
+            model_size="tiny",
+            predictor_dim=256,
+            predictor_depth=None,
+            predictor_heads=None,
+        )
+
+        apply_predictor_size_preset(args)
+
+        self.assertEqual(args.predictor_dim, 256)
+        self.assertEqual(args.predictor_depth, 2)
+        self.assertEqual(args.predictor_heads, 4)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_feature_extraction_preset_resolves_official_vitl_config(self) -> None:
+        args = SimpleNamespace(
+            encoder_preset="vitl_384",
+            encoder=None,
+            vjepa_checkpoint=None,
+            checkpoint_key=None,
+            output_dir=None,
+            dtype="fp32",
+        )
+
+        resolved = resolve_feature_extraction_args(args)
+
+        self.assertEqual(resolved.encoder, "vit_large_384")
+        self.assertEqual(resolved.checkpoint_key, "ema_encoder")
+        self.assertEqual(resolved.vjepa_checkpoint, Path("checkpoints/vjepa2_1/vjepa2_1_vitl_dist_vitG_384.pt"))
+        self.assertEqual(
+            resolved.output_dir,
+            settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitl_384_ema_fp32",
+        )
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_feature_extraction_manual_encoder_requires_checkpoint(self) -> None:
+        args = SimpleNamespace(
+            encoder_preset="vitb_384",
+            encoder="vit_large_384",
+            vjepa_checkpoint=None,
+            checkpoint_key=None,
+            output_dir=None,
+            dtype="fp32",
+        )
+
+        with self.assertRaises(ValueError):
+            resolve_feature_extraction_args(args)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_sequence_windows_do_not_cross_frame_gap(self) -> None:
@@ -308,6 +445,7 @@ class RCJepaACTests(unittest.TestCase):
                 "raw_frames_per_sample": 6,
                 "sequence_stride": 2,
                 "auto_steps": 3,
+                "predictor_type": "official_lite",
                 "predictor_dim": 32,
                 "predictor_depth": 2,
                 "predictor_heads": 4,
@@ -327,6 +465,7 @@ class RCJepaACTests(unittest.TestCase):
         self.assertEqual(config.raw_frames_per_sample, 6)
         self.assertEqual(config.sequence_stride, 2)
         self.assertEqual(config.auto_steps, 3)
+        self.assertEqual(config.predictor_type, "official_lite")
         self.assertEqual(config.predictor_dim, 32)
         self.assertEqual(config.predictor_depth, 2)
         self.assertEqual(config.predictor_heads, 4)

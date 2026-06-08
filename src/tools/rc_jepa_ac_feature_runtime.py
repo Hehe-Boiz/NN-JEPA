@@ -11,10 +11,11 @@ import torch
 from data import settings
 from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS
 from models.rc_jepa_ac import (
+    DEFAULT_PREDICTOR_TYPE,
     DEFAULT_PREDICTOR_DEPTH,
     DEFAULT_PREDICTOR_DIM,
     DEFAULT_PREDICTOR_HEADS,
-    SimpleACPredictor,
+    build_ac_predictor,
 )
 
 
@@ -28,6 +29,7 @@ class FeaturePredictorConfig:
     raw_frames_per_sample: int
     sequence_stride: int
     auto_steps: int
+    predictor_type: str
     predictor_dim: int
     predictor_depth: int
     predictor_heads: int
@@ -95,6 +97,7 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> FeaturePredictorConfig
         raw_frames_per_sample=int(checkpoint_args.get("raw_frames_per_sample", settings.AC_RAW_FRAMES_PER_SAMPLE)),
         sequence_stride=int(checkpoint_args.get("sequence_stride", settings.AC_SEQUENCE_STRIDE)),
         auto_steps=int(checkpoint_args.get("auto_steps", settings.AC_AUTO_STEPS)),
+        predictor_type=str(checkpoint_args.get("predictor_type", DEFAULT_PREDICTOR_TYPE)),
         predictor_dim=int(checkpoint_args.get("predictor_dim", DEFAULT_PREDICTOR_DIM)),
         predictor_depth=int(checkpoint_args.get("predictor_depth", DEFAULT_PREDICTOR_DEPTH)),
         predictor_heads=int(checkpoint_args.get("predictor_heads", DEFAULT_PREDICTOR_HEADS)),
@@ -108,9 +111,10 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> FeaturePredictorConfig
 def build_predictor_from_checkpoint(
     checkpoint: dict[str, Any],
     device: torch.device,
-) -> tuple[SimpleACPredictor, FeaturePredictorConfig]:
+) -> tuple[torch.nn.Module, FeaturePredictorConfig]:
     config = config_from_checkpoint(checkpoint)
-    predictor = SimpleACPredictor(
+    predictor = build_ac_predictor(
+        predictor_type=config.predictor_type,
         latent_dim=config.embed_dim,
         state_dim=len(config.state_columns),
         action_dim=len(config.action_columns),

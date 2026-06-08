@@ -138,12 +138,70 @@ button.secondary:hover {
   font-weight: 700;
 }
 
+.extract-preset-field {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .job-status {
   padding: 10px 12px;
   border-radius: 12px;
   background: rgba(38, 51, 65, 0.08);
   color: #3b342e;
   font-size: 14px;
+}
+
+.job-progress {
+  display: grid;
+  gap: 8px;
+}
+
+.job-progress-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: #3b342e;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.job-progress-top span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-progress-track {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(38, 51, 65, 0.12);
+}
+
+.job-progress-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #476a75, #d68a4b);
+  transition: width 0.25s ease;
+}
+
+.job-progress-fill.indeterminate {
+  width: 35%;
+  animation: progress-sweep 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes progress-sweep {
+  from {
+    transform: translateX(-20%);
+  }
+
+  to {
+    transform: translateX(210%);
+  }
 }
 
 .main {
