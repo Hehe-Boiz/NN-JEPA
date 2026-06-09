@@ -200,6 +200,7 @@ cython_debug/
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, 
 
 # Local training artifacts
+/data/experiments/
 /data/raw/
 /data/processed/
 /data/previews/
