@@ -33,6 +33,8 @@ def build_train_args(cfg: Any) -> Namespace:
     args.action_columns = list(data_cfg.get("action_columns", args.action_columns))
     args.raw_frames_per_sample = int(data_cfg.get("raw_frames_per_sample", args.raw_frames_per_sample))
     args.sequence_stride = int(data_cfg.get("sequence_stride", args.sequence_stride))
+    args.frame_stride = int(data_cfg.get("frame_stride", args.frame_stride))
+    args.target_fps = float(data_cfg.get("target_fps", args.target_fps))
     args.auto_steps = int(data_cfg.get("auto_steps", args.auto_steps))
 
     args.predictor_type = str(model_cfg.get("type", args.predictor_type))

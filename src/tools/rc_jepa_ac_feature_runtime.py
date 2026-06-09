@@ -28,6 +28,8 @@ class FeaturePredictorConfig:
     action_columns: tuple[str, ...]
     raw_frames_per_sample: int
     sequence_stride: int
+    frame_stride: int
+    target_fps: float
     auto_steps: int
     predictor_type: str
     predictor_dim: int
@@ -96,6 +98,8 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> FeaturePredictorConfig
         action_columns=action_columns,
         raw_frames_per_sample=int(checkpoint_args.get("raw_frames_per_sample", settings.AC_RAW_FRAMES_PER_SAMPLE)),
         sequence_stride=int(checkpoint_args.get("sequence_stride", settings.AC_SEQUENCE_STRIDE)),
+        frame_stride=int(checkpoint_args.get("frame_stride", settings.AC_FRAME_STRIDE)),
+        target_fps=float(checkpoint_args.get("target_fps", settings.AC_TARGET_FPS)),
         auto_steps=int(checkpoint_args.get("auto_steps", settings.AC_AUTO_STEPS)),
         predictor_type=str(checkpoint_args.get("predictor_type", DEFAULT_PREDICTOR_TYPE)),
         predictor_dim=int(checkpoint_args.get("predictor_dim", DEFAULT_PREDICTOR_DIM)),

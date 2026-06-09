@@ -184,6 +184,8 @@ def main() -> None:
         manifest_dir=manifest_dir,
         raw_frames_per_sample=config.raw_frames_per_sample,
         sequence_stride=config.sequence_stride,
+        frame_stride=config.frame_stride,
+        target_fps=config.target_fps,
         state_columns=config.state_columns,
         action_columns=config.action_columns,
     )

@@ -1,6 +1,6 @@
 # @package _global_
 
-output_dir: checkpoints/rc_jepa_ac_vitb_features_newdata_tiny
+output_dir: checkpoints/rc_jepa_ac_vitb_features_newdata_tiny_frame_stride2
 
 runtime:
   dry_run: false
@@ -20,7 +20,7 @@ data:
     - throttle_cmd_t
   raw_frames_per_sample: 8
   sequence_stride: 1
-  frame_stride: 1
+  frame_stride: 2
   target_fps: 0.0
   auto_steps: 2
 
@@ -53,7 +53,7 @@ wandb:
   disabled: false
   project: nn-jepa-rc
   entity: null
-  run_name: rc-jepa-tiny-newdata
+  run_name: rc-jepa-tiny-newdata-frame-stride2
   run_id: null
   continue_run: true
   resume: allow
@@ -63,6 +63,7 @@ wandb:
     - hydra
     - new-data
     - simple
+    - frame-stride2
   log_every: 20
   watch_log: gradients
   watch_freq: 200

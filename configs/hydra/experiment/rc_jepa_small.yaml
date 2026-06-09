@@ -20,6 +20,8 @@ data:
     - throttle_cmd_t
   raw_frames_per_sample: 8
   sequence_stride: 1
+  frame_stride: 1
+  target_fps: 0.0
   auto_steps: 2
 
 model:

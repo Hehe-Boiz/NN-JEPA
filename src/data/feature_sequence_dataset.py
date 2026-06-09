@@ -36,6 +36,8 @@ class RCJepaACFeatureSequenceDataset(Dataset):
         manifest_path: str | Path | None = None,
         raw_frames_per_sample: int = settings.AC_RAW_FRAMES_PER_SAMPLE,
         sequence_stride: int = settings.AC_SEQUENCE_STRIDE,
+        frame_stride: int = settings.AC_FRAME_STRIDE,
+        target_fps: float = settings.AC_TARGET_FPS,
         state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
         action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
         state_normalizer: FeatureNormalizer | None = None,
@@ -47,12 +49,18 @@ class RCJepaACFeatureSequenceDataset(Dataset):
             raise ValueError("raw_frames_per_sample must be >= 2")
         if sequence_stride < 1:
             raise ValueError("sequence_stride must be >= 1")
+        if frame_stride < 1:
+            raise ValueError("frame_stride must be >= 1")
+        if target_fps < 0:
+            raise ValueError("target_fps must be >= 0")
 
         self.split = split
         self.features_dir = Path(features_dir)
         self.manifest_path = Path(manifest_path or settings.MANIFEST_DIR / f"{split}.jsonl")
         self.raw_frames_per_sample = raw_frames_per_sample
         self.sequence_stride = sequence_stride
+        self.frame_stride = frame_stride
+        self.target_fps = target_fps
         self.state_columns = tuple(state_columns)
         self.action_columns = tuple(action_columns)
         self.state_normalizer = state_normalizer
@@ -69,6 +77,8 @@ class RCJepaACFeatureSequenceDataset(Dataset):
             self.samples,
             raw_frames_per_sample=self.raw_frames_per_sample,
             sequence_stride=self.sequence_stride,
+            frame_stride=self.frame_stride,
+            target_fps=self.target_fps,
             state_columns=self.state_columns,
             action_columns=self.action_columns,
             max_frame_index_gap=self.max_frame_index_gap,
@@ -178,6 +188,8 @@ def create_ac_feature_sequence_dataloaders(
     manifest_dir: str | Path | None = None,
     raw_frames_per_sample: int = settings.AC_RAW_FRAMES_PER_SAMPLE,
     sequence_stride: int = settings.AC_SEQUENCE_STRIDE,
+    frame_stride: int = settings.AC_FRAME_STRIDE,
+    target_fps: float = settings.AC_TARGET_FPS,
     state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
     action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
 ) -> dict[str, DataLoader]:
@@ -211,6 +223,8 @@ def create_ac_feature_sequence_dataloaders(
             manifest_path=manifest_root / f"{split}.jsonl",
             raw_frames_per_sample=raw_frames_per_sample,
             sequence_stride=sequence_stride,
+            frame_stride=frame_stride,
+            target_fps=target_fps,
             state_columns=state_columns,
             action_columns=action_columns,
             state_normalizer=state_normalizer,

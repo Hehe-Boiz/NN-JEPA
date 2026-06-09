@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from pathlib import Path
 import random
 from typing import Any, Sequence
@@ -73,6 +74,8 @@ class RCJepaACSequenceDataset(Dataset):
         manifest_path: str | Path | None = None,
         raw_frames_per_sample: int = settings.AC_RAW_FRAMES_PER_SAMPLE,
         sequence_stride: int = settings.AC_SEQUENCE_STRIDE,
+        frame_stride: int = settings.AC_FRAME_STRIDE,
+        target_fps: float = settings.AC_TARGET_FPS,
         state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
         action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
         augment: bool | None = None,
@@ -85,11 +88,17 @@ class RCJepaACSequenceDataset(Dataset):
             raise ValueError("raw_frames_per_sample must be >= 2")
         if sequence_stride < 1:
             raise ValueError("sequence_stride must be >= 1")
+        if frame_stride < 1:
+            raise ValueError("frame_stride must be >= 1")
+        if target_fps < 0:
+            raise ValueError("target_fps must be >= 0")
 
         self.split = split
         self.manifest_path = Path(manifest_path or settings.MANIFEST_DIR / f"{split}.jsonl")
         self.raw_frames_per_sample = raw_frames_per_sample
         self.sequence_stride = sequence_stride
+        self.frame_stride = frame_stride
+        self.target_fps = target_fps
         self.state_columns = tuple(state_columns)
         self.action_columns = tuple(action_columns)
         self.state_normalizer = state_normalizer
@@ -101,6 +110,8 @@ class RCJepaACSequenceDataset(Dataset):
             self.samples,
             raw_frames_per_sample=self.raw_frames_per_sample,
             sequence_stride=self.sequence_stride,
+            frame_stride=self.frame_stride,
+            target_fps=self.target_fps,
             state_columns=self.state_columns,
             action_columns=self.action_columns,
             max_frame_index_gap=self.max_frame_index_gap,
@@ -170,9 +181,16 @@ def build_sequence_windows(
     sequence_stride: int,
     state_columns: Sequence[str],
     action_columns: Sequence[str],
+    frame_stride: int = settings.AC_FRAME_STRIDE,
+    target_fps: float = settings.AC_TARGET_FPS,
     max_frame_index_gap: int = settings.AC_MAX_FRAME_INDEX_GAP,
     max_time_gap_sec: float = settings.AC_MAX_TIME_GAP_SEC,
 ) -> list[list[int]]:
+    if frame_stride < 1:
+        raise ValueError("frame_stride must be >= 1")
+    if target_fps < 0:
+        raise ValueError("target_fps must be >= 0")
+
     session_to_indices: dict[str, list[int]] = defaultdict(list)
     for sample_index, sample in enumerate(samples):
         if has_required_columns(sample, state_columns=state_columns, action_columns=action_columns):
@@ -181,14 +199,25 @@ def build_sequence_windows(
     windows: list[list[int]] = []
     for indices in session_to_indices.values():
         indices.sort(key=lambda sample_index: sample_sort_key(samples[sample_index]))
-        if len(indices) < raw_frames_per_sample:
+        effective_frame_stride = resolve_effective_frame_stride(
+            samples=samples,
+            indices=indices,
+            frame_stride=frame_stride,
+            target_fps=target_fps,
+        )
+        required_span = ((raw_frames_per_sample - 1) * effective_frame_stride) + 1
+        if len(indices) < required_span:
             continue
-        last_start = len(indices) - raw_frames_per_sample
+        last_start = len(indices) - required_span
         for start in range(0, last_start + 1, sequence_stride):
-            window = indices[start : start + raw_frames_per_sample]
+            window = [
+                indices[start + (offset * effective_frame_stride)]
+                for offset in range(raw_frames_per_sample)
+            ]
             if is_contiguous_window(
                 samples,
                 window,
+                expected_frame_stride=effective_frame_stride,
                 max_frame_index_gap=max_frame_index_gap,
                 max_time_gap_sec=max_time_gap_sec,
             ):
@@ -218,25 +247,78 @@ def sample_sort_key(sample: dict[str, Any]) -> tuple[float, int]:
 def is_contiguous_window(
     samples: list[dict[str, Any]],
     window: Sequence[int],
+    expected_frame_stride: int,
     max_frame_index_gap: int,
     max_time_gap_sec: float,
 ) -> bool:
+    expected_frame_stride = max(int(expected_frame_stride), 1)
+    max_allowed_frame_gap = (
+        expected_frame_stride + max(max_frame_index_gap - 1, 0)
+        if max_frame_index_gap > 0
+        else 0
+    )
+    max_allowed_time_gap = max_time_gap_sec * expected_frame_stride
     for left_index, right_index in zip(window, window[1:]):
         left = samples[left_index]
         right = samples[right_index]
         frame_gap = int(right["frame_index"]) - int(left["frame_index"])
-        if max_frame_index_gap > 0 and frame_gap < 1:
+        if max_frame_index_gap > 0 and frame_gap < expected_frame_stride:
             return False
-        if max_frame_index_gap > 0 and frame_gap > max_frame_index_gap:
+        if max_frame_index_gap > 0 and frame_gap > max_allowed_frame_gap:
             return False
 
         left_t = timestamp_to_float(left.get("timestamp_sec"))
         right_t = timestamp_to_float(right.get("timestamp_sec"))
         if max_time_gap_sec > 0 and left_t == left_t and right_t == right_t:
             time_gap = right_t - left_t
-            if time_gap <= 0 or time_gap > max_time_gap_sec:
+            if time_gap <= 0 or time_gap > max_allowed_time_gap:
                 return False
     return True
+
+
+def resolve_effective_frame_stride(
+    samples: list[dict[str, Any]],
+    indices: Sequence[int],
+    frame_stride: int,
+    target_fps: float,
+) -> int:
+    if target_fps <= 0:
+        return max(int(frame_stride), 1)
+
+    source_fps = estimate_source_fps(samples, indices)
+    if source_fps is None or source_fps <= 0:
+        return max(int(frame_stride), 1)
+    return max(1, int(math.ceil(source_fps / target_fps)))
+
+
+def estimate_source_fps(samples: list[dict[str, Any]], indices: Sequence[int]) -> float | None:
+    frame_periods: list[float] = []
+    for left_index, right_index in zip(indices, indices[1:]):
+        left = samples[left_index]
+        right = samples[right_index]
+        left_t = timestamp_to_float(left.get("timestamp_sec"))
+        right_t = timestamp_to_float(right.get("timestamp_sec"))
+        if left_t != left_t or right_t != right_t:
+            continue
+        frame_gap = int(right["frame_index"]) - int(left["frame_index"])
+        time_gap = right_t - left_t
+        if frame_gap <= 0 or time_gap <= 0:
+            continue
+        frame_periods.append(time_gap / frame_gap)
+    if not frame_periods:
+        return None
+    period = median_float(frame_periods)
+    if period <= 0:
+        return None
+    return 1.0 / period
+
+
+def median_float(values: Sequence[float]) -> float:
+    ordered = sorted(float(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
 
 
 def timestamp_to_float(value: Any) -> float:
@@ -255,6 +337,8 @@ def create_ac_sequence_dataloaders(
     manifest_dir: str | Path | None = None,
     raw_frames_per_sample: int = settings.AC_RAW_FRAMES_PER_SAMPLE,
     sequence_stride: int = settings.AC_SEQUENCE_STRIDE,
+    frame_stride: int = settings.AC_FRAME_STRIDE,
+    target_fps: float = settings.AC_TARGET_FPS,
     state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
     action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
 ) -> dict[str, DataLoader]:
@@ -287,6 +371,8 @@ def create_ac_sequence_dataloaders(
             manifest_path=manifest_root / f"{split}.jsonl",
             raw_frames_per_sample=raw_frames_per_sample,
             sequence_stride=sequence_stride,
+            frame_stride=frame_stride,
+            target_fps=target_fps,
             state_columns=state_columns,
             action_columns=action_columns,
             state_normalizer=state_normalizer,

@@ -71,6 +71,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-columns", nargs="+", default=list(DEFAULT_AC_ACTION_COLUMNS))
     parser.add_argument("--raw-frames-per-sample", type=int, default=settings.AC_RAW_FRAMES_PER_SAMPLE)
     parser.add_argument("--sequence-stride", type=int, default=settings.AC_SEQUENCE_STRIDE)
+    parser.add_argument("--frame-stride", type=int, default=settings.AC_FRAME_STRIDE)
+    parser.add_argument("--target-fps", type=float, default=settings.AC_TARGET_FPS)
     parser.add_argument("--image-size", type=int, default=settings.AC_IMAGE_SIZE)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--tubelet-size", type=int, default=settings.AC_TUBELET_SIZE)
@@ -420,8 +422,18 @@ def load_resume_checkpoint(
 
 def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.Namespace) -> None:
     checkpoint_args = dict(checkpoint.get("args", {}))
+    legacy_defaults = {
+        "raw_frames_per_sample": settings.AC_RAW_FRAMES_PER_SAMPLE,
+        "frame_stride": settings.AC_FRAME_STRIDE,
+        "target_fps": settings.AC_TARGET_FPS,
+        "auto_steps": settings.AC_AUTO_STEPS,
+    }
     checked_fields = (
         "predictor_type",
+        "raw_frames_per_sample",
+        "frame_stride",
+        "target_fps",
+        "auto_steps",
         "predictor_dim",
         "predictor_depth",
         "predictor_heads",
@@ -429,10 +441,13 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
     )
     mismatches = []
     for field in checked_fields:
-        if field not in checkpoint_args:
+        if field in checkpoint_args:
+            checkpoint_value = checkpoint_args[field]
+        elif field in legacy_defaults:
+            checkpoint_value = legacy_defaults[field]
+        else:
             continue
         current_value = getattr(args, field)
-        checkpoint_value = checkpoint_args[field]
         if current_value != checkpoint_value:
             mismatches.append(
                 {
@@ -472,6 +487,8 @@ def main() -> None:
         manifest_dir=args.manifest_dir,
         raw_frames_per_sample=args.raw_frames_per_sample,
         sequence_stride=args.sequence_stride,
+        frame_stride=args.frame_stride,
+        target_fps=args.target_fps,
         state_columns=args.state_columns,
         action_columns=args.action_columns,
     )
