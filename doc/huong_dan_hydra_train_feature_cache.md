@@ -192,7 +192,7 @@ Chỉ dùng lệnh này nếu bạn muốn nối tiếp đúng run W&B cũ `8an0
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
   experiment=rc_jepa_base \
   output_dir=checkpoints/rc_jepa_ac_vitb_features \
-  data.features_dir=data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  data.features_dir=data/processed/features/vjepa2_1_vitb_384_ema_fp16 \
   data.manifest_dir=data/processed/manifests \
   train.resume_from=checkpoints/rc_jepa_ac_vitb_features/last.pt \
   train.epochs=100 \
@@ -248,7 +248,7 @@ Nếu muốn thử predictor gần source V-JEPA AC hơn:
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
   experiment=rc_jepa_official_lite_tiny \
   output_dir=checkpoints/rc_jepa_ac_vitb_features_newdata_official_lite_tiny \
-  data.features_dir=data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  data.features_dir=data/processed/features/vjepa2_1_vitb_384_ema_fp16 \
   data.manifest_dir=data/processed/manifests \
   train.batch_size=4 \
   train.eval_batch_size=1 \
@@ -276,7 +276,7 @@ Trước khi train thật:
 Kiểm tra cache còn thiếu session hay không:
 
 ```bash
-PYTHONPATH=src python3 -c "from pathlib import Path; import json; m=Path('data/processed/manifests'); f=Path('data/processed/features/vjepa2_1_vitb_384_ema_fp32/sessions'); s={json.loads(line)['session_id'] for split in ('train','val','test') for line in (m/f'{split}.jsonl').read_text().splitlines() if line.strip()}; j={p.stem for p in f.glob('*.json')}; n={p.stem for p in f.glob('*.npy')}; print({'manifest_sessions':len(s),'json':len(j),'npy':len(n),'missing_json':len(s-j),'missing_npy':len(s-n)}); print(sorted(s-j)[:20])"
+PYTHONPATH=src python3 -c "from pathlib import Path; import json; m=Path('data/processed/manifests'); f=Path('data/processed/features/vjepa2_1_vitb_384_ema_fp16/sessions'); s={json.loads(line)['session_id'] for split in ('train','val','test') for line in (m/f'{split}.jsonl').read_text().splitlines() if line.strip()}; j={p.stem for p in f.glob('*.json')}; n={p.stem for p in f.glob('*.npy')}; print({'manifest_sessions':len(s),'json':len(j),'npy':len(n),'missing_json':len(s-j),'missing_npy':len(s-n)}); print(sorted(s-j)[:20])"
 ```
 
 Nếu `missing_json` hoặc `missing_npy` lớn hơn `0`, cần extract bù feature trước.

@@ -1362,13 +1362,13 @@ Chức năng:
 Hàm:
 
 ```python
-vjepa21_feature_output_dir(preset_name, dtype="fp32")
+vjepa21_feature_output_dir(preset_name, dtype="fp16")
 ```
 
 Chức năng:
 
 - Tạo output dir chuẩn cho feature cache theo preset và dtype.
-- Ví dụ `data/processed/features/vjepa2_1_vitb_384_ema_fp32`.
+- Ví dụ `data/processed/features/vjepa2_1_vitb_384_ema_fp16`.
 
 Hàm:
 
@@ -2446,7 +2446,7 @@ Cảnh báo:
 Constants:
 
 ```python
-DEFAULT_FEATURES_DIR = data/processed/features/vjepa2_1_vitb_384_ema_fp32
+DEFAULT_FEATURES_DIR = data/processed/features/vjepa2_1_vitb_384_ema_fp16
 DEFAULT_OUTPUT_DIR = checkpoints/rc_jepa_ac_vitb_features_20260607
 ```
 

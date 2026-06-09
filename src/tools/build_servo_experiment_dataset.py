@@ -31,10 +31,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-root", type=Path, default=DEFAULT_EXPERIMENT_ROOT)
     parser.add_argument("--current-raw-root", type=Path, default=settings.RAW_DATA_DIR)
     parser.add_argument("--old-servo-root", type=Path, default=DEFAULT_OLD_SERVO_ROOT)
-    parser.add_argument("--mode", choices=["mixed", "old-only", "current-only"], default="mixed")
+    parser.add_argument("--mode", choices=["mixed", "current-only"], default="mixed")
     parser.add_argument("--current-domain", default="current_servo")
     parser.add_argument("--old-domain", default="old_servo")
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
+    parser.add_argument(
+        "--split-file",
+        type=Path,
+        default=None,
+        help="Optional JSON with explicit train/val session ids. Old servo ids may use a _kds suffix.",
+    )
     split_group = parser.add_mutually_exclusive_group()
     split_group.add_argument(
         "--no-test-split",
@@ -66,7 +72,7 @@ def collect_session_sources(args: argparse.Namespace) -> list[SessionSource]:
             SessionSource(path=path, domain=args.current_domain, raw_root=args.current_raw_root)
             for path in find_session_dirs(args.current_raw_root)
         )
-    if args.mode in ("mixed", "old-only"):
+    if args.mode == "mixed":
         sources.extend(
             SessionSource(path=path, domain=args.old_domain, raw_root=args.old_servo_root)
             for path in find_session_dirs(args.old_servo_root)
@@ -115,6 +121,74 @@ def build_domain_split(session_domains: dict[str, str], seed: int, include_test:
             include_test=include_test,
         )
         split_map.update(domain_split)
+    return split_map
+
+
+def load_explicit_split(path: Path) -> dict[str, list[str]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Split file must be a JSON object: {path}")
+    split_ids: dict[str, list[str]] = {}
+    seen: dict[str, str] = {}
+    for split_name in ("train", "val"):
+        values = payload.get(split_name)
+        if not isinstance(values, list):
+            raise ValueError(f"Split file must contain a `{split_name}` list: {path}")
+        split_ids[split_name] = []
+        for value in values:
+            session_id = str(value)
+            if session_id in seen:
+                raise ValueError(
+                    f"Session {session_id!r} appears in both {seen[session_id]!r} and {split_name!r}"
+                )
+            seen[session_id] = split_name
+            split_ids[split_name].append(session_id)
+    return split_ids
+
+
+def build_split_aliases(source: SessionSource, old_domain: str) -> list[str]:
+    aliases = [source.path.name]
+    if source.domain == old_domain:
+        aliases.append(f"{source.path.name}_kds")
+    return aliases
+
+
+def build_explicit_split_map(
+    sources: Sequence[SessionSource],
+    split_file: Path,
+    old_domain: str,
+) -> dict[str, str]:
+    split_ids = load_explicit_split(split_file)
+    alias_to_source: dict[str, SessionSource] = {}
+    for source in sources:
+        for alias in build_split_aliases(source, old_domain=old_domain):
+            if alias in alias_to_source:
+                raise ValueError(f"Duplicate split alias {alias!r} for selected sources")
+            alias_to_source[alias] = source
+
+    split_map: dict[str, str] = {}
+    missing: list[str] = []
+    for split_name, session_ids in split_ids.items():
+        for session_id in session_ids:
+            source = alias_to_source.get(session_id)
+            if source is None:
+                missing.append(session_id)
+                continue
+            if source.path.name in split_map and split_map[source.path.name] != split_name:
+                raise ValueError(f"Source {source.path.name!r} maps to multiple splits")
+            split_map[source.path.name] = split_name
+
+    if missing:
+        preview = ", ".join(missing[:10])
+        suffix = "" if len(missing) <= 10 else f", ... +{len(missing) - 10} more"
+        raise ValueError(f"Split file references missing sessions: {preview}{suffix}")
+
+    unused_sources = sorted(source.path.name for source in sources if source.path.name not in split_map)
+    if unused_sources:
+        preview = ", ".join(unused_sources[:10])
+        suffix = "" if len(unused_sources) <= 10 else f", ... +{len(unused_sources) - 10} more"
+        raise ValueError(f"Selected sources are not present in split file: {preview}{suffix}")
+
     return split_map
 
 
@@ -209,6 +283,7 @@ def main() -> None:
                 {
                     "mode": args.mode,
                     "experiment_root": str(args.experiment_root),
+                    "split_file": None if args.split_file is None else str(args.split_file),
                     "selected_sessions": len(sources),
                     "include_test": not args.no_test_split,
                     "test_is_val_alias": bool(args.no_test_split and settings.ALIAS_TEST_TO_VAL),
@@ -249,7 +324,14 @@ def main() -> None:
         if not session_samples:
             raise RuntimeError("No usable samples found for servo experiment")
 
-        split_map = build_domain_split(session_domains, seed=args.seed, include_test=not args.no_test_split)
+        if args.split_file is not None:
+            split_map = build_explicit_split_map(
+                sources=sources,
+                split_file=args.split_file,
+                old_domain=args.old_domain,
+            )
+        else:
+            split_map = build_domain_split(session_domains, seed=args.seed, include_test=not args.no_test_split)
         manifest_counts = {"train": 0, "val": 0, "test": 0}
         manifest_sessions: dict[str, list[str]] = {"train": [], "val": [], "test": []}
         manifest_samples: dict[str, list[dict[str, Any]]] = {"train": [], "val": [], "test": []}
@@ -281,6 +363,7 @@ def main() -> None:
         summary = {
             "experiment_root": str(args.experiment_root),
             "mode": args.mode,
+            "split_file": None if args.split_file is None else str(args.split_file),
             "current_raw_root": str(args.current_raw_root),
             "old_servo_root": str(args.old_servo_root),
             "processed_data_dir": str(output_paths["processed_root"]),

@@ -100,6 +100,8 @@ class SessionWebViewerTests(unittest.TestCase):
         self.assertIn("vitb_384", feature_command)
         self.assertIn("--batch-size", feature_command)
         self.assertIn("16", feature_command)
+        self.assertIn("--dtype", feature_command)
+        self.assertIn("fp16", feature_command)
         self.assertIn("--num-workers", feature_command)
         self.assertIn("2", feature_command)
         self.assertIn("vitl_384", vitl_feature_command)
@@ -125,6 +127,7 @@ class SessionWebViewerTests(unittest.TestCase):
 
         self.assertEqual(presets["vitb_384"]["encoder_name"], "vit_base_384")
         self.assertEqual(presets["vitb_384"]["checkpoint_key"], "ema_encoder")
+        self.assertTrue(presets["vitb_384"]["default_output_dir"].endswith("_fp16"))
         self.assertEqual(presets["vitl_384"]["encoder_name"], "vit_large_384")
         self.assertEqual(presets["vitg_384"]["checkpoint_key"], "target_encoder")
         self.assertEqual(presets["vitG_384"]["encoder_name"], "vit_gigantic_384")

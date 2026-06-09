@@ -1,6 +1,6 @@
 # MEMORY - Dự án NN-JEPA cho xe RC
 
-## Cập nhật mới nhất - 2026-06-09
+## Cập nhật mới nhất - 2026-06-10
 
 Repo hiện tại là `NN-JEPA`, dùng cho phần train. Repo `JEPA/` chỉ phục vụ phần cứng, recorder, sync sensor và staging data.
 
@@ -28,7 +28,8 @@ smoke offline CEM planner: pass với max-samples=1, horizon=1, cem-samples=2
 smoke planning plot SVG: pass trên /tmp/nn_jepa_plan_smoke/planning_test.jsonl
 Hydra dry-run rc_jepa_tiny_newdata: pass
 Hydra wandb.continue_run=true/false: pass
-feature cache ViT-B fp32: manifest 100 session, 100 json, 100 npy, missing = 0
+feature cache ViT-B fp32: đã xóa để giải phóng disk
+feature cache ViT-B fp16: chưa extract lại
 official_lite predictor trước đó: pass shape/mask/RoPE/loss smoke
 action-block causal mask: khớp source vjepa2 cho case thật [4624, 4624]
 RoPE rotation: khớp source vjepa2, max diff = 0.0
@@ -41,7 +42,7 @@ Blocker môi trường hiện tại trước khi train thật:
 GPU/CUDA: nvidia-smi fail, chưa giao tiếp được NVIDIA driver
 ```
 
-Vì vậy cần sửa GPU/driver trước khi train thật. Feature cache hiện đã đủ theo manifest mới nhất.
+Vì vậy cần sửa GPU/driver trước khi train thật, rồi extract lại feature fp16.
 
 `JEPA/` vừa kiểm tra sau khi pull:
 
@@ -60,18 +61,16 @@ offline CEM/eval_goal_reaching trước closed-loop thật.
 Trạng thái data/manifest hiện tại:
 
 ```text
-data/raw: 100 session
+data/raw: 181 session
 data/raw session cũ 20260605: không còn trong data/raw theo audit trước
 processed manifest:
-  train: 84766 samples, 68139 windows
-  val:   29780 samples, 24397 windows
-  test:  29780 samples, 24397 windows  # alias của val
+  train: 103208 samples, 82623 windows
+  val:   57829 samples, 48103 windows
+  test:  57829 samples, 48103 windows  # alias của val
 feature cache:
-  path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
-  files: 100 .npy + 100 .json
-  metadata: 114546 frame, 576 token/frame, embed_dim 768, fp32
-  missing_json_count: 0
-  missing_npy_count: 0
+  path: data/processed/features/vjepa2_1_vitb_384_ema_fp16
+  status: chưa extract lại sau khi xóa fp32
+  expected metadata: 161037 frame, 576 token/frame, embed_dim 768, fp16
 ```
 
 Ghi chú inference sau khi đọc JEPA mới:
@@ -169,7 +168,7 @@ PYTHONPATH=src python3 -m tools.extract_vjepa_features \
   --encoder-preset vitb_384 \
   --manifest-dir data/processed/manifests \
   --batch-size 32 \
-  --dtype fp32
+  --dtype fp16
 ```
 
 Nếu đổi preset encoder thì phải train predictor lại với đúng feature dir mới.
@@ -178,7 +177,7 @@ Feature extractor hiện có fast-skip:
 
 - Nếu session đã có `.npy + .json` đúng shape/dtype thì skip session đó.
 - Nếu toàn bộ cache đầy đủ và metadata khớp thì kết thúc sớm, không load encoder/checkpoint.
-- Cache baseline ViT-B fp32 hiện đủ 100 session theo manifest baseline.
+- Cache baseline ViT-B fp16 cần extract lại sau khi đã xóa fp32.
 - Với experiment mixed servo cũ, extractor có `--seed-from-features-dir` để reuse feature baseline nếu metadata encoder khớp.
 
 Experiment servo cũ đã triển khai riêng, không làm bẩn baseline:
@@ -186,24 +185,21 @@ Experiment servo cũ đã triển khai riêng, không làm bẩn baseline:
 ```text
 tool build: src/tools/build_servo_experiment_dataset.py
 mixed root: data/experiments/servo_old_mix_v1
-old-only root: data/experiments/servo_old_only_v1
 mixed hydra: configs/hydra/experiment/rc_jepa_tiny_mix_oldservo_frame_stride2.yaml
-old-only hydra: configs/hydra/experiment/rc_jepa_tiny_oldservo_frame_stride2.yaml
 ```
 
 Audit experiment servo cũ:
 
 ```text
 mixed:
-  sessions: current_servo 100 + old_servo 28
-  samples train/val/test: 114579 / 49226 / 49226 alias val
-  frame_stride=2 windows train/val/test: 79765 / 34926 / 34926 alias val
-  domain windows train: current_servo 54216, old_servo 25549
-
-old-only:
-  sessions: old_servo 28
-  samples train/val/test: 36564 / 12695 / 12695 alias val
-  frame_stride=2 windows train/val/test: 25549 / 8865 / 8865 alias val
+  ý nghĩa: current_servo trong data/raw + old_servo trong JEPA/data/drive_extra_nonzip
+  split file: data/split_vjepa_ac_car.json
+  sessions: current_servo 181 + old_servo 30 = 211
+  samples train/val/test: 182562 / 30282 / 30282 alias val
+  frame_stride=2 windows train/val/test: 128617 / 20501 / 20501 alias val
+  train domain samples: current_servo 133677, old_servo 48885
+  val domain samples: current_servo 27360, old_servo 2922
+old-only: đã xóa, không còn Hydra config riêng
 ```
 
 Chưa chạy feature extraction/train thật cho experiment servo cũ vì GPU driver đang lỗi:
@@ -218,7 +214,7 @@ Các default quan trọng hiện tại:
 ```text
 feature train output: checkpoints/rc_jepa_ac_vitb_features_20260607
 eval/infer default checkpoint: checkpoints/rc_jepa_ac_vitb_features_20260607/best.pt
-feature cache path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
+feature cache path: data/processed/features/vjepa2_1_vitb_384_ema_fp16
 V-JEPA checkpoint: checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt
 checkpoint key: ema_encoder
 encoder: vit_base_384
@@ -727,9 +723,9 @@ NUMERIC_NORMALIZE_CLIP = 8.0
 Preprocess hiện tại đã rebuild manifest với outlier robust:
 
 ```text
-train: 84766 samples, 68139 windows
-val:   29780 samples, 24397 windows
-test:  29780 samples, 24397 windows  # alias của val
+train: 103208 samples, 82623 windows
+val:   57829 samples, 48103 windows
+test:  57829 samples, 48103 windows  # alias của val
 ```
 
 Report mới:
@@ -785,15 +781,14 @@ Log offline:
 ## Việc nên làm tiếp
 
 1. Sửa GPU/driver trước, vì `nvidia-smi` đang fail.
-2. Baseline feature cache ViT-B fp32 hiện đủ 100 session; chỉ extract lại nếu Drive có session mới hoặc đổi feature preset.
+2. Baseline feature cache ViT-B fp16 cần extract lại vì fp32 đã xóa để giảm dung lượng.
 3. Nếu Drive có data mới: mở web, bấm `Sync Drive` và theo dõi progress/log.
 4. Kiểm tra session mới trong web viewer.
 5. Bấm `Preprocess` để rebuild manifest và theo dõi progress theo session.
 6. Chọn `Feature model`, rồi bấm `Extract V-JEPA Features`; cache cũ đúng thì sẽ skip, session mới thì mới extract.
-7. Với experiment servo cũ: chạy extract feature cho `servo_old_mix_v1` hoặc `servo_old_only_v1` sau khi GPU hoạt động.
+7. Với experiment servo cũ: chỉ còn `servo_old_mix_v1`; chạy extract feature sau khi GPU hoạt động.
 8. Train thử `simple tiny` mixed servo bằng Hydra: `experiment=rc_jepa_tiny_mix_oldservo_frame_stride2`.
-9. Train thử `simple tiny` old-only bằng Hydra: `experiment=rc_jepa_tiny_oldservo_frame_stride2`.
-10. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
-11. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
-12. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
-13. Sau khi loss ổn, thêm planner/MPC hoặc policy head để chọn action.
+9. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
+10. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
+11. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
+12. Sau khi loss ổn, thêm planner/MPC hoặc policy head để chọn action.

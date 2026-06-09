@@ -19,7 +19,7 @@ from models.rc_jepa_ac import (
 )
 
 
-DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp32"
+DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp16"
 
 
 @dataclass(frozen=True)

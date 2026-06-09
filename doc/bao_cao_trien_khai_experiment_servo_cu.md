@@ -1,162 +1,203 @@
-# Báo cáo triển khai experiment dùng data servo cũ
+# Báo cáo triển khai experiment trộn data servo cũ
 
-Ngày viết: 2026-06-09
+Ngày cập nhật: 2026-06-10
 
-Phạm vi: repo `NN-JEPA`. Repo `JEPA/` chỉ được đọc để lấy data/staging, không sửa code gốc trong `JEPA/` hoặc `vjepa2/`.
+Phạm vi: repo `NN-JEPA`. Repo `JEPA/` chỉ được dùng làm nguồn data/staging, không sửa code gốc trong `JEPA/` hoặc `vjepa2/`.
 
-## 1. Mục tiêu
+## 1. Trạng thái hiện tại
 
-Mục tiêu của experiment này là thử tận dụng lại data servo cũ `KDS 680HV` như một experiment riêng, không làm bẩn baseline data hiện tại.
-
-Baseline hiện tại vẫn giữ nguyên:
-
-```text
-data/raw
-data/processed
-data/processed/features/vjepa2_1_vitb_384_ema_fp32
-checkpoints/rc_jepa_ac_vitb_features_20260607
-```
-
-Experiment mới dùng root riêng:
+Experiment dùng data servo cũ hiện chỉ giữ một nhánh chính:
 
 ```text
 data/experiments/servo_old_mix_v1
-data/experiments/servo_old_only_v1
 ```
 
 Ý nghĩa:
 
 - `servo_old_mix_v1`: trộn data servo hiện tại trong `data/raw` với data servo cũ.
-- `servo_old_only_v1`: chỉ dùng data servo cũ để kiểm tra domain cũ riêng.
+- `servo_old_only_v1`: đã xóa, không còn Hydra config riêng.
 - Không copy data cũ vào `data/raw`.
 - Không ghi đè `data/processed` baseline.
-- Không dùng lại checkpoint train cũ để resume, vì dữ liệu và split đã đổi. Nên train fresh.
+- Không dùng lại checkpoint train cũ để resume, vì data và split đã đổi.
 
-## 2. Nguồn data
+Feature cache mặc định hiện chuyển sang `fp16`:
 
-Data hiện tại:
+```text
+data/processed/features/vjepa2_1_vitb_384_ema_fp16
+data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16
+```
+
+Feature cache `fp32` baseline cũ đã bị xóa vì quá nặng:
+
+```text
+data/processed/features/vjepa2_1_vitb_384_ema_fp32
+```
+
+## 2. Vì sao bỏ `servo_old_only_v1`
+
+Ban đầu có ý tưởng chạy hai experiment:
+
+```text
+mixed    = current servo + old servo
+old-only = chỉ old servo
+```
+
+Sau khi thống nhất lại, file split chính thức là:
+
+```text
+data/split_vjepa_ac_car.json
+```
+
+File này chứa cả session current servo và session servo cũ. Vì vậy nó chỉ phù hợp với experiment trộn:
+
+```text
+servo_old_mix_v1
+```
+
+Nếu dùng split này cho `old-only`, các session current trong split sẽ không có trong source old-servo, dẫn tới split sai mục tiêu. Do đó `old-only` bị bỏ để tránh nhầm:
+
+- Không còn folder `data/experiments/servo_old_only_v1`.
+- Không còn config `rc_jepa_tiny_oldservo_frame_stride2.yaml`.
+- `tools.build_servo_experiment_dataset` không còn nhận `--mode old-only`.
+
+## 3. Hai kiểu experiment còn dùng
+
+### 3.1. Không trộn data servo cũ
+
+Dùng baseline current data:
+
+```text
+manifest_dir = data/processed/manifests
+features_dir = data/processed/features/vjepa2_1_vitb_384_ema_fp16
+```
+
+Hydra config nên dùng để test nhanh:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_newdata
+```
+
+Config này không đọc data servo cũ.
+
+### 3.2. Trộn data servo cũ
+
+Dùng experiment root riêng:
+
+```text
+manifest_dir = data/experiments/servo_old_mix_v1/processed/manifests
+features_dir = data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16
+split_file   = data/split_vjepa_ac_car.json
+```
+
+Hydra config nên dùng để test nhanh:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_mix_oldservo_frame_stride2
+```
+
+Config này dùng `frame_stride=2`, gần tinh thần temporal spacing của source V-JEPA AC hơn so với lấy 8 frame sát nhau.
+
+## 4. Nguồn data
+
+Current servo:
 
 ```text
 data/raw/session_*
 ```
 
-Data servo cũ:
+Old servo:
 
 ```text
 JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV/session_*
 ```
 
-Audit hiện tại:
+Audit sau khi cập nhật:
 
 ```text
-data/raw: 100 session hiện tại
-data servo cũ KDS 680HV: 28 session cũ
+current servo trong data/raw: 181 session
+old servo source: 30 session
+tổng session trong split_vjepa_ac_car.json: 211 session
+missing session so với source hiện có: 0
 ```
 
-Tất cả 28 session servo cũ preprocess được, không có session `status != ok`.
+Trong 30 session old servo:
 
-## 3. File code đã thêm/sửa
+- 28 session có alias `_kds` trong split.
+- 2 session old servo được lấy từ `JEPA/data/drive_zips/trong nhà`: `session_20260605_225028`, `session_20260605_225326`.
 
-### 3.1. Tool build experiment dataset
+## 5. Code chính đã thêm/sửa
 
-File mới:
+### 5.1. `src/tools/build_servo_experiment_dataset.py`
 
-```text
-src/tools/build_servo_experiment_dataset.py
-```
+Tool này build experiment root riêng.
 
-Tool này làm các việc sau:
-
-1. Chọn session theo mode:
+Mode còn dùng:
 
 ```text
-mixed       = data/raw + data servo cũ
-old-only    = chỉ data servo cũ
+mixed        = data/raw + data servo cũ
 current-only = chỉ data/raw nhưng ghi ra experiment root riêng
 ```
 
-2. Chạy lại `preprocess_one_session` cho từng session nhưng tạm thời đổi output root sang experiment root.
+Tham số quan trọng:
 
-3. Gắn metadata domain vào từng sample:
-
-```json
-{
-  "data_domain": "current_servo",
-  "source_raw_root": "...",
-  "servo_experiment_mode": "mixed"
-}
+```bash
+--split-file data/split_vjepa_ac_car.json
+--no-test-split
 ```
 
-4. Chia train/val theo session và theo từng domain. Không tạo test split độc lập; `test.jsonl` được ghi bằng chính `val.jsonl` để tương thích tool cũ.
+Khi có `--split-file`, tool không chia random nữa mà dùng đúng danh sách `train` và `val` trong JSON.
 
-Điểm quan trọng: split theo domain giúp mixed experiment không bị trường hợp old servo chỉ nằm toàn bộ ở train hoặc toàn bộ ở val.
-
-### 3.2. DataLoader trả thêm `data_domain`
-
-Các file đã cập nhật:
+Tool cũng tạo alias cho old-servo:
 
 ```text
-src/data/sequence_dataset.py
-src/data/feature_sequence_dataset.py
+session_xxx
+session_xxx_kds
 ```
 
-Mỗi sample sequence giờ trả thêm:
+Nhờ vậy split file có thể chứa tên old-servo dạng `_kds`, còn folder source thật vẫn là `session_xxx`.
+
+### 5.2. `src/data/sequence_dataset.py`
+
+Dataset sequence từ ảnh processed trả thêm:
 
 ```python
 "data_domain": first_sample.get("data_domain", "unknown")
 ```
 
-Nhờ vậy `val` có thể tách metric theo domain ngay trong train. `test` vẫn có thể tách domain nếu chạy eval/test riêng hoặc bật `--run-test`, nhưng hiện `test` chỉ là alias của `val`, không phải tập đánh giá độc lập.
+### 5.3. `src/data/feature_sequence_dataset.py`
 
-### 3.3. Train loop log metric theo domain
+Dataset sequence từ feature cache cũng trả thêm `data_domain`.
 
-File đã cập nhật:
-
-```text
-src/tools/train_rc_jepa_ac_features.py
-```
-
-Trong train loop feature-cache:
-
-- Train vẫn log loss tổng như cũ.
-- Val/test sẽ tính thêm loss theo từng `data_domain`; test hiện là val alias.
-
-Metric sinh ra có dạng:
+Điểm này giúp train loop log loss theo domain:
 
 ```text
 val/domain/current_servo/loss
-val/domain/current_servo/teacher_forcing_loss
-val/domain/current_servo/rollout_loss
 val/domain/old_servo/loss
-val/domain/old_servo/teacher_forcing_loss
-val/domain/old_servo/rollout_loss
-test/domain/current_servo/loss  # chỉ khi chạy test riêng hoặc --run-test, hiện là val alias
-test/domain/old_servo/loss      # chỉ khi chạy test riêng hoặc --run-test, hiện là val alias
 ```
 
-Ý nghĩa: mixed experiment sẽ biết model đang tốt trên servo hiện tại nhưng tệ trên servo cũ, hoặc ngược lại.
+### 5.4. `src/tools/train_rc_jepa_ac_features.py`
 
-### 3.4. Feature extractor có seed cache
+Train loop feature-cache hiện:
 
-File đã cập nhật:
+- Train loss tổng như cũ.
+- Val loss tổng như cũ.
+- Val loss theo domain nếu batch có `data_domain`.
+- Early stopping và best checkpoint vẫn dựa trên `val/loss` tổng.
 
-```text
-src/tools/extract_vjepa_features.py
-```
+### 5.5. `src/tools/extract_vjepa_features.py`
 
-Tham số mới:
+Feature extractor có:
 
 ```bash
---seed-from-features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32
+--seed-from-features-dir
+--dtype fp16
 ```
 
-Tác dụng:
+`--seed-from-features-dir` dùng để reuse feature cache baseline nếu metadata khớp. Với mixed experiment, sau khi baseline fp16 đã extract xong, có thể seed current sessions từ baseline rồi chỉ encode thêm old sessions.
 
-- Với mixed experiment, 100 session hiện tại đã có feature cache baseline.
-- Tool sẽ symlink `.npy + .json` tương ứng vào feature dir experiment nếu metadata khớp.
-- Chỉ encode thêm session cũ chưa có cache.
-
-Điều kiện để seed cache được chấp nhận:
+Metadata phải khớp các trường quan trọng:
 
 ```text
 format_version
@@ -173,240 +214,182 @@ normalization_mean
 normalization_std
 ```
 
-Nếu metadata không khớp, tool không reuse cache và sẽ encode lại. Đây là để tránh lỗi nguy hiểm khi shape vô tình trùng nhưng encoder/checkpoint khác.
+Nếu không khớp, tool sẽ không reuse để tránh trộn feature sai encoder/dtype.
 
-### 3.5. Hydra configs mới
-
-File mới:
-
-```text
-configs/hydra/experiment/rc_jepa_tiny_mix_oldservo_frame_stride2.yaml
-configs/hydra/experiment/rc_jepa_tiny_oldservo_frame_stride2.yaml
-```
-
-Cả hai config đều dùng:
-
-```text
-predictor_type = simple
-model_size = tiny
-raw_frames_per_sample = 8
-frame_stride = 2
-target_fps = 0.0
-auto_steps = 2
-batch_size = 32
-eval_batch_size = 2
-warmup_epochs = 5
-early_stopping_patience = 15
-```
-
-Đây là bản tiny để thử nghiệm nhanh. Nếu kết quả ổn thì mới nâng lên `small` hoặc `base`.
-
-## 4. Kết quả build dataset
-
-### 4.1. Mixed experiment
+## 6. Kết quả build `servo_old_mix_v1`
 
 Lệnh đã chạy:
 
 ```bash
-conda run -n nn-jepa env PYTHONPATH=src python3 -m tools.build_servo_experiment_dataset \
+PYTHONPATH=src python3 -m tools.build_servo_experiment_dataset \
   --mode mixed \
   --experiment-root data/experiments/servo_old_mix_v1 \
+  --split-file data/split_vjepa_ac_car.json \
   --no-test-split
 ```
 
-Kết quả manifest:
+Kết quả:
 
 ```text
-train samples: 114579
-val samples:   49226
-test samples:  49226  # test alias val
+train samples: 182562
+val samples:   30282
+test samples:  30282  # test alias val
 ```
 
 Session split:
 
 ```text
-current_servo: train 70, val 30, test 30  # test alias val
-old_servo:     train 19, val 9,  test 9   # test alias val
+train sessions: 169
+val sessions:   42
+test sessions:  42  # test alias val
 ```
 
-Sequence thật với cấu hình `raw_frames_per_sample=8`, `frame_stride=2`:
+Domain session split:
 
 ```text
-train windows: 79765
-  current_servo: 54216
-  old_servo:     25549
-
-val windows: 34926
-  current_servo: 26061
-  old_servo:     8865
-
-test windows: 34926  # test alias val
+current_servo: train 143, val 38, test 38
+old_servo:     train 26,  val 4,  test 4
 ```
 
-### 4.2. Old-only experiment
+Sequence/window count với `raw_frames_per_sample=8`, `frame_stride=2`:
 
-Lệnh đã chạy:
+```text
+train windows: 128617
+val windows:    20501
+test windows:   20501  # test alias val
+```
+
+Domain sample count:
+
+```text
+train current_servo samples: 133677
+train old_servo samples:      48885
+val current_servo samples:    27360
+val old_servo samples:         2922
+```
+
+## 7. Lệnh extract feature fp16
+
+### 7.1. Baseline current data
+
+Chạy trước để tạo cache current-data fp16:
 
 ```bash
-conda run -n nn-jepa env PYTHONPATH=src python3 -m tools.build_servo_experiment_dataset \
-  --mode old-only \
-  --experiment-root data/experiments/servo_old_only_v1 \
-  --no-test-split
+PYTHONPATH=src python3 -m tools.extract_vjepa_features \
+  --vjepa-root vjepa2 \
+  --encoder-preset vitb_384 \
+  --manifest-dir data/processed/manifests \
+  --batch-size 32 \
+  --dtype fp16
 ```
 
-Kết quả manifest:
+Output mặc định:
 
 ```text
-train samples: 36564
-val samples:   12695
-test samples:  12695  # test alias val
+data/processed/features/vjepa2_1_vitb_384_ema_fp16
 ```
 
-Session split:
+### 7.2. Mixed data với seed từ baseline
 
-```text
-old_servo: train 19, val 9, test 9  # test alias val
-```
-
-Sequence thật với cấu hình `raw_frames_per_sample=8`, `frame_stride=2`:
-
-```text
-train windows: 25549
-val windows:   8865
-test windows:  8865  # test alias val
-```
-
-## 5. Lệnh extract feature
-
-GPU hiện tại đang lỗi driver:
-
-```text
-nvidia-smi: failed because it could not communicate with NVIDIA driver
-torch.cuda.is_available(): False
-```
-
-Vì vậy chưa chạy extract feature thật cho experiment này trong lượt triển khai. Không nên chạy ViT-B feature extraction bằng CPU vì rất chậm và không đúng điều kiện train.
-
-Sau khi GPU hoạt động lại, chạy mixed feature extraction:
+Chạy sau khi baseline fp16 đã có:
 
 ```bash
 PYTHONPATH=src python3 -m tools.extract_vjepa_features \
   --vjepa-root vjepa2 \
   --encoder-preset vitb_384 \
   --manifest-dir data/experiments/servo_old_mix_v1/processed/manifests \
-  --output-dir data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp32 \
-  --seed-from-features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --output-dir data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16 \
+  --seed-from-features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp16 \
   --batch-size 32 \
-  --dtype fp32 \
+  --dtype fp16 \
   --splits train val
 ```
 
-Lệnh này sẽ:
+Nếu baseline fp16 chưa có, bỏ `--seed-from-features-dir` hoặc extract baseline trước.
 
-- reuse feature của 100 session hiện tại nếu metadata khớp
-- encode thêm 28 session servo cũ
-- ghi feature cache riêng vào `data/experiments/servo_old_mix_v1/features/...`
+## 8. Lệnh train
 
-Extract old-only:
+### 8.1. Train tiny không trộn old-servo
 
 ```bash
-PYTHONPATH=src python3 -m tools.extract_vjepa_features \
-  --vjepa-root vjepa2 \
-  --encoder-preset vitb_384 \
-  --manifest-dir data/experiments/servo_old_only_v1/processed/manifests \
-  --output-dir data/experiments/servo_old_only_v1/features/vjepa2_1_vitb_384_ema_fp32 \
-  --batch-size 32 \
-  --dtype fp32 \
-  --splits train val
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_newdata
 ```
 
-## 6. Lệnh train
-
-### 6.1. Mixed servo tiny
+### 8.2. Train tiny mixed old-servo
 
 ```bash
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
   experiment=rc_jepa_tiny_mix_oldservo_frame_stride2
 ```
 
-Config này chạy:
-
-```text
-features_dir = data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp32
-manifest_dir = data/experiments/servo_old_mix_v1/processed/manifests
-output_dir = checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_tiny_frame_stride2
-```
-
-### 6.2. Old-only tiny
+Nếu muốn xem config trước khi chạy thật:
 
 ```bash
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
-  experiment=rc_jepa_tiny_oldservo_frame_stride2
+  experiment=rc_jepa_tiny_mix_oldservo_frame_stride2 \
+  runtime.dry_run=true \
+  runtime.require_cuda=false
 ```
 
-Config này chạy:
+## 9. Có cần train lại từ đầu không?
 
-```text
-features_dir = data/experiments/servo_old_only_v1/features/vjepa2_1_vitb_384_ema_fp32
-manifest_dir = data/experiments/servo_old_only_v1/processed/manifests
-output_dir = checkpoints/rc_jepa_ac_vitb_features_oldservo_tiny_frame_stride2
-```
-
-## 7. Có cần train lại từ đầu không?
-
-Có. Với experiment này nên train lại từ đầu.
+Có, với mixed experiment nên train lại từ đầu.
 
 Lý do:
 
-- Data distribution đổi vì thêm servo cũ.
-- Split train/val đổi, và test split độc lập bị bỏ khỏi train experiment. `test.jsonl` chỉ còn là alias của `val.jsonl`.
-- `frame_stride=2` làm mỗi sample không còn là 8 frame sát nhau.
+- Data distribution đổi vì thêm old-servo.
+- Split train/val đổi theo `data/split_vjepa_ac_car.json`.
+- `frame_stride=2` làm một sample không còn là 8 frame sát nhau.
 - Normalization state/action được tính lại từ train manifest.
 - Nếu resume checkpoint cũ, optimizer/scheduler và best-val history không còn đại diện cho experiment mới.
 
-Nếu chỉ muốn fine-tune từ checkpoint cũ thì nên làm thành experiment riêng sau, không trộn với kết quả train fresh.
+Nếu muốn fine-tune từ checkpoint cũ, nên tạo experiment riêng, không trộn với kết quả train fresh.
 
-## 8. Rủi ro khi dùng servo cũ
+## 10. Rủi ro khi trộn servo cũ
 
-Data servo cũ không chắc cùng phân phối với servo hiện tại.
+Old-servo không chắc cùng phân phối với current-servo.
 
-Các rủi ro chính:
+Rủi ro chính:
 
-- Servo khác có response khác, cùng `steering_cmd_t` có thể tạo quỹ đạo khác.
-- Throttle range của data cũ hẹp hơn, ví dụ report old-only cho thấy `throttle_cmd_t` khoảng `[-0.1, 0.09]`.
-- Một số state như `steering_last_t`, `throttle_last_t`, `v_t` có thể phải đọc/suy từ sensor hoặc previous action tùy session.
-- Nếu trộn không kiểm soát, model có thể học trung bình giữa hai domain và làm giảm chất lượng trên servo hiện tại.
+- Cùng `steering_cmd_t` có thể tạo góc lái thật khác do servo khác.
+- Cùng `throttle_cmd_t` có thể tạo gia tốc khác nếu ESC/motor/pin khác.
+- State như `steering_last_t`, `throttle_last_t`, `yaw_rate_t`, `accel_x_t`, `accel_y_t` có thể có nhiễu hoặc bias khác.
+- Nếu data cũ nhiều nhưng lệch domain, model có thể giảm chất lượng trên current-servo.
 
-Vì vậy thứ tự nên chạy:
-
-1. `old-only tiny`: kiểm tra data cũ có học được dynamics hữu hạn không.
-2. `mixed tiny`: kiểm tra thêm data cũ có làm `val/domain/current_servo/*` xấu đi không.
-3. Chỉ nếu tiny ổn mới chạy `small/base`.
-
-## 9. Kết quả kiểm tra đã chạy
-
-Các kiểm tra đã pass:
+Vì vậy khi train mixed, phải theo dõi cả:
 
 ```text
-py_compile:
-  src/tools/extract_vjepa_features.py
-  src/tools/build_servo_experiment_dataset.py
-  src/tools/train_rc_jepa_ac_features.py
-  src/data/feature_sequence_dataset.py
-  src/data/sequence_dataset.py
-
-build mixed dataset: pass
-build old-only dataset: pass
-manifest audit mixed: pass
-manifest audit old-only: pass
-preprocess_report bad_sessions: 0
-Hydra dry-run mixed tiny: pass
-Hydra dry-run old-only tiny: pass
+val/loss
+val/domain/current_servo/loss
+val/domain/old_servo/loss
 ```
 
-Kiểm tra chưa chạy được:
+Nếu `val/domain/current_servo/loss` xấu đi nhiều, cần giảm tỷ trọng old-servo hoặc tách domain conditioning rõ hơn.
+
+## 11. Kiểm tra đã chạy
+
+Các kiểm tra sau đã pass sau cập nhật 2026-06-10:
 
 ```text
-Feature extraction thật: chưa chạy do GPU driver lỗi.
-Train thật: chưa chạy vì feature experiment chưa extract xong và GPU chưa hoạt động.
+split_vjepa_ac_car.json:
+  ids: 211
+  unique_ids: 211
+  raw_dirs matched: 181
+  old_dirs matched: 30
+  missing: 0
+
+servo_old_mix_v1:
+  train samples: 182562
+  val samples: 30282
+  test samples: 30282
+  train windows: 128617
+  val windows: 20501
+  test windows: 20501
+
+deleted:
+  data/experiments/servo_old_only_v1
+  data/processed/features/vjepa2_1_vitb_384_ema_fp32
 ```
+
+Feature extraction thật chưa chạy lại trong bước cập nhật này. Sau khi chạy lệnh extract fp16, cần audit lại metadata trước khi bật train qua đêm.

@@ -296,7 +296,7 @@ Chạy official-lite tiny:
 
 ```bash
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
-    --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+    --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp16 \
     --manifest-dir data/processed/manifests \
     --output-dir checkpoints/rc_jepa_ac_vitb_features_20260607_official_lite_tiny \
     --predictor-type official_lite \
@@ -540,7 +540,7 @@ Nếu muốn CLI thuần:
 
 ```bash
 PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
-    --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+    --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp16 \
     --manifest-dir data/processed/manifests \
     --output-dir checkpoints/rc_jepa_ac_vitb_features_20260607_official_lite_tiny \
     --predictor-type official_lite \

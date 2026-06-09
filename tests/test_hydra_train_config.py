@@ -12,7 +12,7 @@ class HydraTrainConfigTests(unittest.TestCase):
             {
                 "output_dir": "checkpoints/tiny",
                 "data": {
-                    "features_dir": "data/processed/features/vjepa2_1_vitb_384_ema_fp32",
+                    "features_dir": "data/processed/features/vjepa2_1_vitb_384_ema_fp16",
                     "manifest_dir": "data/processed/manifests",
                     "state_columns": ["yaw_rate_t", "accel_x_t"],
                     "action_columns": ["steering_cmd_t", "throttle_cmd_t"],

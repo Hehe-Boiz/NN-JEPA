@@ -121,7 +121,7 @@ def get_vjepa21_feature_preset(name: str) -> VJepa21FeaturePreset:
         raise ValueError(f"Unknown V-JEPA 2.1 feature preset {name!r}. Available: {available}") from exc
 
 
-def vjepa21_feature_output_dir(preset_name: str, dtype: str = "fp32") -> Path:
+def vjepa21_feature_output_dir(preset_name: str, dtype: str = "fp16") -> Path:
     preset = get_vjepa21_feature_preset(preset_name)
     return settings.PROCESSED_DATA_DIR / "features" / f"{preset.output_dir_stem}_{dtype}"
 
@@ -134,7 +134,7 @@ def vjepa21_feature_preset_options() -> list[dict[str, str]]:
             "encoder_name": preset.encoder_name,
             "checkpoint_path": str(preset.checkpoint_path),
             "checkpoint_key": preset.checkpoint_key,
-            "default_output_dir": str(vjepa21_feature_output_dir(preset.name, "fp32")),
+            "default_output_dir": str(vjepa21_feature_output_dir(preset.name, "fp16")),
             "note": preset.note,
         }
         for preset in VJEPA21_FEATURE_PRESETS.values()

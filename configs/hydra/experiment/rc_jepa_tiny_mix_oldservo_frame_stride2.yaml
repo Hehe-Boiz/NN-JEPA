@@ -7,7 +7,7 @@ runtime:
   require_cuda: true
 
 data:
-  features_dir: data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp32
+  features_dir: data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16
   manifest_dir: data/experiments/servo_old_mix_v1/processed/manifests
   state_columns:
     - yaw_rate_t

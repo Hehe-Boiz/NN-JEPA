@@ -1,14 +1,14 @@
 # @package _global_
 
-output_dir: checkpoints/rc_jepa_ac_vitb_features_oldservo_tiny_frame_stride2
+output_dir: checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_official_lite_tiny_frame_stride2
 
 runtime:
   dry_run: false
   require_cuda: true
 
 data:
-  features_dir: data/experiments/servo_old_only_v1/features/vjepa2_1_vitb_384_ema_fp32
-  manifest_dir: data/experiments/servo_old_only_v1/processed/manifests
+  features_dir: data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16
+  manifest_dir: data/experiments/servo_old_mix_v1/processed/manifests
   state_columns:
     - yaw_rate_t
     - accel_x_t
@@ -25,7 +25,7 @@ data:
   auto_steps: 2
 
 model:
-  type: simple
+  type: official_lite
   size: tiny
   predictor_dim: null
   predictor_depth: null
@@ -34,9 +34,9 @@ model:
 
 train:
   epochs: 100
-  batch_size: 32
-  eval_batch_size: 2
-  num_workers: 8
+  batch_size: 4
+  eval_batch_size: 1
+  num_workers: 4
   lr: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
@@ -54,14 +54,16 @@ wandb:
   disabled: false
   project: nn-jepa-rc
   entity: null
-  run_name: rc-jepa-tiny-oldservo-frame-stride2
+  run_name: rc-jepa-official-lite-tiny-mix-oldservo-frame-stride2
   run_id: null
   continue_run: true
   resume: allow
   mode: online
   tags:
+    - official_lite
     - tiny
     - hydra
+    - mixed-servo
     - old-servo
     - frame-stride2
   log_every: 20

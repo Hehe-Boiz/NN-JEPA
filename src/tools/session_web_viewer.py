@@ -170,7 +170,7 @@ def build_extract_feature_command(
         "--batch-size",
         str(batch_size),
         "--dtype",
-        "fp32",
+        "fp16",
     ]
     if num_workers is not None:
         command += ["--num-workers", str(num_workers)]

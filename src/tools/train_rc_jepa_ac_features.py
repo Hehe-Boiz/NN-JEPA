@@ -59,7 +59,7 @@ from tools.wandb_utils import (
 )
 
 
-DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp32"
+DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp16"
 DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_vitb_features_20260607")
 
 

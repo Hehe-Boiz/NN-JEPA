@@ -204,7 +204,11 @@ cython_debug/
 /data/raw/
 /data/processed/
 /data/previews/
+/data/split_vjepa_ac_car.json
 /checkpoints/
+/JEPA/
+/vjepa2/
+/wandb/
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 # Temporary file for partial code execution

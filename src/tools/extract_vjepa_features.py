@@ -34,7 +34,7 @@ from models.vjepa21_presets import (
 )
 
 
-DEFAULT_OUTPUT_DIR = vjepa21_feature_output_dir(DEFAULT_VJEPA21_FEATURE_PRESET, "fp32")
+DEFAULT_OUTPUT_DIR = vjepa21_feature_output_dir(DEFAULT_VJEPA21_FEATURE_PRESET, "fp16")
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = settings.NUM_WORKERS
 PROGRESS_PREFIX = "__JOB_PROGRESS__ "
@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tubelet-size", type=int, default=settings.AC_TUBELET_SIZE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
-    parser.add_argument("--dtype", choices=["fp16", "fp32"], default="fp32")
+    parser.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
