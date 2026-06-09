@@ -1,5 +1,233 @@
 # MEMORY - Dự án NN-JEPA cho xe RC
 
+## Cập nhật mới nhất - 2026-06-09
+
+Repo hiện tại là `NN-JEPA`, dùng cho phần train. Repo `JEPA/` chỉ phục vụ phần cứng, recorder, sync sensor và staging data.
+
+Các báo cáo quan trọng gần nhất:
+
+```text
+doc/full_audit_report_20260608.md
+doc/bao_cao_vjepa2_ac_vs_nn_jepa.md
+doc/bao_cao_kha_nang_dung_predictor_ac_official.md
+doc/bao_cao_trien_khai_official_lite_predictor.md
+doc/bao_cao_oom_eval_val_vs_train_batch.md
+doc/bao_cao_jepa_update_20260609_inference.md
+doc/ke_hoach_inference_an_toan_nn_jepa.md
+```
+
+Kết quả audit mới nhất:
+
+```text
+compileall: pass
+unit tests: 46/46 pass
+git diff --check: pass
+smoke train-val-test-checkpoint: pass, loss hữu hạn
+smoke offline CEM planner: pass với max-samples=1, horizon=1, cem-samples=2
+smoke planning plot SVG: pass trên /tmp/nn_jepa_plan_smoke/planning_test.jsonl
+Hydra dry-run rc_jepa_tiny_newdata: pass
+Hydra wandb.continue_run=true/false: pass
+feature cache ViT-B fp32: manifest 100 session, 100 json, 100 npy, missing = 0
+official_lite predictor trước đó: pass shape/mask/RoPE/loss smoke
+action-block causal mask: khớp source vjepa2 cho case thật [4624, 4624]
+RoPE rotation: khớp source vjepa2, max diff = 0.0
+git diff --check: pass
+```
+
+Blocker môi trường hiện tại trước khi train thật:
+
+```text
+GPU/CUDA: nvidia-smi fail, chưa giao tiếp được NVIDIA driver
+```
+
+Vì vậy cần sửa GPU/driver trước khi train thật. Feature cache hiện đã đủ theo manifest mới nhất.
+
+`JEPA/` vừa kiểm tra sau khi pull:
+
+```text
+HEAD: e841729 Update HANDOFF: overnight results + inference blockers
+Commit kỹ thuật chính ngay trước đó: 30215d8 Add VJEPA2ACCar
+Thay đổi chính: VJEPA2ACCar patch-token V-JEPA-2-AC cho xe RC, full IMU 10D,
+encode_patch 256px ViT-L, ACClipDataset memmap, CEMPlannerAC, CarDynamics,
+train_ac_car và báo cáo inference blocker.
+Kết quả JEPA báo cáo: VJEPA2ACCar rollout@1 ratio 0.826, rollout@3 ratio 0.775,
+tốt hơn pooled baseline rollout@1 ratio 0.867.
+Ảnh hưởng tới NN-JEPA: chưa ảnh hưởng trực tiếp; nên port theo từng bước, ưu tiên
+offline CEM/eval_goal_reaching trước closed-loop thật.
+```
+
+Trạng thái data/manifest hiện tại:
+
+```text
+data/raw: 100 session
+data/raw session cũ 20260605: không còn trong data/raw theo audit trước
+processed manifest:
+  train: 84766 samples, 68139 windows
+  val:   9470 samples, 8259 windows
+  test:  20310 samples, 16138 windows
+feature cache:
+  path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
+  files: 100 .npy + 100 .json
+  metadata: 114546 frame, 576 token/frame, embed_dim 768, fp32
+  missing_json_count: 0
+  missing_npy_count: 0
+```
+
+Ghi chú inference sau khi đọc JEPA mới:
+
+```text
+JEPA chưa có scripts/inference_loop.py hoàn chỉnh.
+pc_stream_view.py hiện chỉ nhận phone -> PC, chưa gửi action ngược.
+robot/capture/controller.py còn UDP cũ; JEPA khuyến nghị đổi sang dongle serial ESP-NOW.
+Hướng đúng cho NN-JEPA: offline CEM planner/eval trước, sau đó live dry-run, cuối cùng mới closed-loop thật.
+Không dùng lẫn checkpoint JEPA VJEPA2ACCar với NN-JEPA hiện tại vì feature format khác:
+  JEPA: ViT-L 256, 256 token/frame, D=1024
+  NN-JEPA: ViT-B 384, 576 token/frame, D=768
+```
+
+NN-JEPA đã có bước inference offline kiểu planner:
+
+```text
+src/tools/rc_jepa_ac_cem_planner.py
+src/tools/plan_rc_jepa_ac_features.py
+src/tools/plot_rc_jepa_planning.py
+```
+
+Ý nghĩa: load checkpoint predictor + feature cache, lấy `z_t` và goal `z_{t+k}`,
+chạy CEM trên action raw, tự normalize action đúng như train, rollout predictor,
+chọn action sequence có latent cuối gần goal nhất. Đây chưa phải closed-loop thật
+và chưa gửi lệnh xuống xe.
+
+Tool plot đọc `planning_*.jsonl` và xuất SVG dependency-free:
+
+```text
+latent_l1_comparison.svg
+first_action_planned_vs_groundtruth.svg
+first_action_abs_error.svg
+action_sequence_record_*.svg
+```
+
+Drive/staging đã audit trước đó:
+
+```text
+JEPA/data/drive_zips: 65 zip khớp Drive, 0 differences
+  63 zip top-level session_20260607_*.zip đã từng được dùng cho train trước khi có thêm data mới
+  2 zip cũ trong trong nhà/ chỉ staging-only, không train
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV:
+  28 session cũ 20260605
+  53403 file
+  actions_synced.csv / imu_synced.csv đủ 28/28
+  không nằm trong data/raw, không dùng train hiện tại
+```
+
+`data servo cũ KDS 680HV` đã được khôi phục thủ công từ 3 zip:
+
+```text
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV-20260608T112340Z-3-001.zip
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV-20260608T112340Z-3-002.zip
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV-20260608T112340Z-3-003.zip
+```
+
+Session `session_20260605_155710` trong data servo cũ từng thiếu synced; đã chạy lại:
+
+```bash
+PYTHONPATH=JEPA/src python -m jepa_wm.data.sync \
+  "JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV/session_20260605_155710"
+```
+
+Kết quả: giữ `47` frame, bỏ `1`, `offset=100ms +imu`.
+
+Web viewer hiện có 3 job riêng:
+
+```text
+Sync Drive: rclone copy zip mới + extract top-level session + chạy sensor sync, không preprocess
+Preprocess: chạy tools.preprocess_data
+Extract V-JEPA Features: chạy tools.extract_vjepa_features
+```
+
+Web viewer có thanh tiến trình trong panel `Data Ops`:
+
+- `Sync Drive`: progress theo stage; byte-level/tốc độ tải của `rclone -P` vẫn xem trong `Job Log`.
+- `Preprocess`: progress theo số session đã xử lý.
+- `Extract V-JEPA Features`: có dropdown `Feature model`, progress theo số session đã extract/skip; nếu cache đủ thì báo 100% ngay.
+
+Feature extractor có preset V-JEPA 2.1:
+
+```text
+vitb_384 -> vit_base_384, checkpoint_key=ema_encoder, output vjepa2_1_vitb_384_ema_<dtype>
+vitl_384 -> vit_large_384, checkpoint_key=ema_encoder, output vjepa2_1_vitl_384_ema_<dtype>
+vitg_384 -> vit_giant_384, checkpoint_key=target_encoder, output vjepa2_1_vitg_384_target_<dtype>
+vitG_384 -> vit_gigantic_384, checkpoint_key=target_encoder, output vjepa2_1_vitG_384_target_<dtype>
+```
+
+Lệnh extract nên dùng preset:
+
+```bash
+PYTHONPATH=src python3 -m tools.extract_vjepa_features \
+  --vjepa-root vjepa2 \
+  --encoder-preset vitb_384 \
+  --manifest-dir data/processed/manifests \
+  --batch-size 32 \
+  --dtype fp32
+```
+
+Nếu đổi preset encoder thì phải train predictor lại với đúng feature dir mới.
+
+Feature extractor hiện có fast-skip:
+
+- Nếu session đã có `.npy + .json` đúng shape/dtype thì skip session đó.
+- Nếu toàn bộ cache đầy đủ và metadata khớp thì kết thúc sớm, không load encoder/checkpoint.
+- Hiện cache chưa đầy đủ vì thiếu 37 session theo manifest mới, cần chạy extract bù sau khi GPU hoạt động.
+
+Các default quan trọng hiện tại:
+
+```text
+feature train output: checkpoints/rc_jepa_ac_vitb_features_20260607
+eval/infer default checkpoint: checkpoints/rc_jepa_ac_vitb_features_20260607/best.pt
+feature cache path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
+V-JEPA checkpoint: checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint key: ema_encoder
+encoder: vit_base_384
+```
+
+Predictor hiện tại có 2 loại:
+
+```text
+simple: baseline cũ, mặc định
+official_lite: predictor mới theo hướng V-JEPA AC official-lite
+```
+
+Chọn bằng:
+
+```bash
+--predictor-type simple
+--predictor-type official_lite
+```
+
+Preset predictor hiện tại với ViT-B 384 feature:
+
+```text
+simple tiny:          predictor_dim=128, depth=2, heads=4, params=670,464
+simple small:         predictor_dim=256, depth=4, heads=4, params=3,706,112
+simple base:          predictor_dim=512, depth=6, heads=8, params=20,007,680
+official_lite tiny:   predictor_dim=128, depth=2, heads=4, params=595,456
+official_lite small:  predictor_dim=256, depth=4, heads=4, params=3,556,096
+official_lite base:   predictor_dim=512, depth=6, heads=8, params=19,707,648
+```
+
+`simple base` vẫn là mặc định. `tiny` dùng `--model-size tiny` để thử pipeline nhanh. `official_lite tiny` nên dùng batch nhỏ hơn, ví dụ `batch_size=4`, `eval_batch_size=1`.
+
+Kiểm tra gần nhất:
+
+```text
+compileall: pass
+unit tests: 41/41 pass
+Hydra official_lite dry-run: pass
+official_lite full-token smoke loss: pass
+web smoke test: /, /app.js, /styles.css, /api/sessions, /api/jobs đều HTTP 200
+không còn rclone/session_web_viewer process nền
+```
+
 ## Mục tiêu của dự án
 
 Dự án này đang xây pipeline dữ liệu và model kiểu JEPA/V-JEPA cho xe RC tự lái trong nhà.
@@ -340,7 +568,9 @@ Nó gồm:
 
 ```text
 FrozenVJepa21Encoder
-SimpleACPredictor
+predictor chọn bằng predictor_type:
+  simple -> SimpleACPredictor
+  official_lite -> VJepaStyleACPredictor
 ```
 
 Encoder:
@@ -353,13 +583,22 @@ Encoder:
 - Chạy trong `torch.no_grad()`.
 - Chỉ tạo latent target tokens.
 
-Predictor:
+Predictor `simple`:
 
 - Là causal transformer nhỏ, dễ đọc hơn predictor public.
 - Nhận latent tokens.
 - Nhận action token.
 - Nhận state token.
 - Chỉ predictor được train.
+
+Predictor `official_lite`:
+
+- Bám theo source V-JEPA AC hơn `simple`.
+- Token layout là `[action, state, patch tokens]`.
+- Dùng action-block causal attention mask giống source `vjepa2`.
+- Dùng RoPE attention frame/height/width.
+- Output vẫn là latent patch tokens.
+- Không phải exact official reproduction vì state/action RC là 5D/2D, còn DROID official là 7D/7D.
 
 Loss:
 
@@ -422,7 +661,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 Kết quả pass.
 
-Lưu ý: tại thời điểm chạy test, môi trường shell chưa có `torch`, nên các test tensor/model bị skip. Code mới vẫn import torch trực tiếp, không có fallback import.
+Lưu ý hiện tại: môi trường `nn-jepa` có `torch`; test tensor/model đã chạy và pass. Code vẫn import torch trực tiếp, không có fallback import.
 
 ## Cập nhật ổn định train mới nhất
 
@@ -443,12 +682,12 @@ NORMALIZE_AC_ACTION_INPUTS = True
 NUMERIC_NORMALIZE_CLIP = 8.0
 ```
 
-Preprocess gần nhất đã rebuild manifest với outlier robust:
+Preprocess hiện tại đã rebuild manifest với outlier robust:
 
 ```text
-train: 29195 samples
-val:    6484 samples
-test:   13579 samples
+train: 84766 samples, 68139 windows
+val:   9470 samples, 8259 windows
+test:  20310 samples, 16138 windows
 ```
 
 Report mới:
@@ -502,10 +741,14 @@ Log offline:
 
 ## Việc nên làm tiếp
 
-1. Dùng môi trường có cài `torch`.
-2. Chạy preprocess nếu chưa có manifest processed.
-3. Chuẩn bị checkpoint V-JEPA 2.1.
-4. Chạy smoke train 1 epoch với batch nhỏ.
-5. Kiểm tra `run_config.json`, `history.json`, `test_metrics.json`.
-6. Xác nhận encoder thật sự freeze và chỉ predictor update.
-7. Sau khi loss ổn, thêm planner/MPC hoặc policy head để chọn action.
+1. Sửa GPU/driver trước, vì `nvidia-smi` đang fail.
+2. Chạy extract bù feature cache ViT-B fp32; hiện manifest có 100 session nhưng cache thiếu 37 `.json`.
+3. Nếu Drive có data mới: mở web, bấm `Sync Drive` và theo dõi progress/log.
+4. Kiểm tra session mới trong web viewer.
+5. Bấm `Preprocess` để rebuild manifest và theo dõi progress theo session.
+6. Chọn `Feature model`, rồi bấm `Extract V-JEPA Features`; cache cũ đúng thì sẽ skip, session mới thì mới extract.
+7. Train thử predictor `simple tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type simple --model-size tiny`.
+8. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
+9. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
+10. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
+11. Sau khi loss ổn, thêm planner/MPC hoặc policy head để chọn action.

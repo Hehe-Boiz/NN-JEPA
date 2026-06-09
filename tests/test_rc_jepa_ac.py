@@ -17,6 +17,7 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 if TORCH_AVAILABLE:
     import torch
 
+    from data.normalization import FeatureNormalizer, FeatureStats
     from data.feature_sequence_dataset import RCJepaACFeatureSequenceDataset
     from data.sequence_dataset import RCJepaACSequenceDataset, build_sequence_windows
     from models.rc_jepa_ac import (
@@ -29,6 +30,11 @@ if TORCH_AVAILABLE:
         compute_world_model_losses,
     )
     from tools.extract_vjepa_features import resolve_feature_extraction_args
+    from tools.rc_jepa_ac_cem_planner import (
+        RCJepaACFeatureCEMPlanner,
+        denormalize_action_tensor,
+        normalize_action_tensor,
+    )
     from tools.rc_jepa_ac_feature_runtime import config_from_checkpoint
     from tools.train_rc_jepa_ac import (
         build_lr_scheduler,
@@ -364,6 +370,62 @@ class RCJepaACTests(unittest.TestCase):
         self.assertEqual(outputs["rollout_loss"].ndim, 0)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_action_normalization_round_trip_for_planner(self) -> None:
+        normalizer = FeatureNormalizer(
+            {
+                "steering_cmd_t": FeatureStats(mean=0.1, std=0.2),
+                "throttle_cmd_t": FeatureStats(mean=-0.2, std=0.5),
+            },
+            clip_value=8.0,
+        )
+        raw_actions = torch.tensor([[[0.3, 0.8], [0.1, -0.2]]])
+
+        model_actions = normalize_action_tensor(
+            raw_actions,
+            action_columns=("steering_cmd_t", "throttle_cmd_t"),
+            action_normalizer=normalizer,
+        )
+        recovered = denormalize_action_tensor(
+            model_actions,
+            action_columns=("steering_cmd_t", "throttle_cmd_t"),
+            action_normalizer=normalizer,
+        )
+
+        self.assertTrue(torch.allclose(recovered, raw_actions, atol=1e-6))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_feature_cem_planner_rollout_shape_and_action_bounds(self) -> None:
+        predictor = ToyPlannerPredictor()
+        planner = RCJepaACFeatureCEMPlanner(
+            predictor=predictor,
+            tokens_per_frame=4,
+            state_columns=tuple(settings.AC_STATE_COLUMNS),
+            action_columns=tuple(settings.AC_ACTION_COLUMNS),
+            action_normalizer=None,
+            horizon=2,
+            n_samples=8,
+            n_elite=2,
+            n_iter=2,
+            action_low=(-0.25, -0.1),
+            action_high=(0.25, 0.1),
+            device="cpu",
+        )
+        context = torch.zeros(4, 8)
+        initial_state = torch.zeros(len(settings.AC_STATE_COLUMNS))
+        raw_actions = torch.zeros(3, 2, len(settings.AC_ACTION_COLUMNS))
+        goal = torch.ones(4, 8) * 0.1
+
+        rollout = planner.rollout(context, initial_state, raw_actions)
+        plan = planner.plan(context, initial_state, goal)
+
+        self.assertEqual(tuple(rollout.shape), (3, 2, 4, 8))
+        self.assertEqual(tuple(plan.first_action.shape), (len(settings.AC_ACTION_COLUMNS),))
+        self.assertGreaterEqual(float(plan.first_action[0]), -0.250001)
+        self.assertLessEqual(float(plan.first_action[0]), 0.250001)
+        self.assertGreaterEqual(float(plan.first_action[1]), -0.100001)
+        self.assertLessEqual(float(plan.first_action[1]), 0.100001)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_lr_schedule_uses_warmup_then_cosine_decay(self) -> None:
         warmup_steps = compute_warmup_steps(warmup_epochs=2, steps_per_epoch=3, total_train_steps=12)
         self.assertEqual(warmup_steps, 6)
@@ -505,13 +567,33 @@ class RCJepaACTests(unittest.TestCase):
             )
             self.assertIsNone(resolve_wandb_run_id(no_resume_args))
 
+            new_wandb_run_args = SimpleNamespace(
+                output_dir=output_dir,
+                resume_from=output_dir / "last.pt",
+                wandb_run_id=None,
+                wandb_resume="allow",
+                wandb_continue_run=False,
+            )
+            self.assertIsNone(resolve_wandb_run_id(new_wandb_run_args))
+
             explicit_args = SimpleNamespace(
                 output_dir=output_dir,
                 resume_from=None,
                 wandb_run_id="manual456",
                 wandb_resume="allow",
+                wandb_continue_run=True,
             )
             self.assertEqual(resolve_wandb_run_id(explicit_args), "manual456")
+
+            explicit_but_disabled_args = SimpleNamespace(
+                output_dir=output_dir,
+                resume_from=None,
+                wandb_run_id="manual456",
+                wandb_resume="allow",
+                wandb_continue_run=False,
+            )
+            with self.assertRaises(ValueError):
+                resolve_wandb_run_id(explicit_but_disabled_args)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_init_wandb_passes_saved_run_id_to_wandb_init(self) -> None:
@@ -536,6 +618,7 @@ class RCJepaACTests(unittest.TestCase):
                     wandb_entity=None,
                     wandb_run_name=None,
                     wandb_run_id=None,
+                    wandb_continue_run=True,
                     wandb_resume="allow",
                     wandb_tags=[],
                     output_dir=output_dir,
@@ -552,6 +635,48 @@ class RCJepaACTests(unittest.TestCase):
             self.assertEqual(captured_kwargs["id"], "abc123")
             self.assertEqual(captured_kwargs["resume"], "allow")
             self.assertEqual(captured_kwargs["project"], "nn-jepa-rc")
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_init_wandb_can_start_new_run_when_resuming_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            (output_dir / "wandb_run_id.txt").write_text("abc123\n", encoding="utf-8")
+            captured_kwargs = {}
+
+            def fake_init(**kwargs: object) -> SimpleNamespace:
+                captured_kwargs.update(kwargs)
+                return SimpleNamespace(id="new-run")
+
+            fake_wandb = SimpleNamespace(init=fake_init)
+            missing = object()
+            old_wandb = sys.modules.get("wandb", missing)
+            sys.modules["wandb"] = fake_wandb
+            try:
+                args = SimpleNamespace(
+                    no_wandb=False,
+                    wandb_mode="online",
+                    wandb_project="nn-jepa-rc",
+                    wandb_entity=None,
+                    wandb_run_name=None,
+                    wandb_run_id=None,
+                    wandb_continue_run=False,
+                    wandb_resume="allow",
+                    wandb_tags=[],
+                    output_dir=output_dir,
+                    resume_from=output_dir / "last.pt",
+                )
+
+                init_wandb(args, config={"a": 1}, job_type="train-rc-jepa-ac-features")
+            finally:
+                if old_wandb is missing:
+                    del sys.modules["wandb"]
+                else:
+                    sys.modules["wandb"] = old_wandb
+
+            self.assertNotIn("id", captured_kwargs)
+            self.assertNotIn("resume", captured_kwargs)
+            self.assertEqual(captured_kwargs["project"], "nn-jepa-rc")
+            self.assertEqual(read_saved_wandb_run_id(args), "new-run")
 
 
 def make_manifest_sample(session_id: str, frame_index: int, image_path: Path) -> dict[str, object]:
@@ -574,6 +699,23 @@ def make_manifest_sample(session_id: str, frame_index: int, image_path: Path) ->
             "throttle_cmd_t": 0.2,
         },
     }
+
+
+class ToyPlannerPredictor(torch.nn.Module if TORCH_AVAILABLE else object):
+    def forward(
+        self,
+        latent_tokens: torch.Tensor,
+        actions: torch.Tensor,
+        states: torch.Tensor,
+        tokens_per_frame: int | None = None,
+    ) -> torch.Tensor:
+        if tokens_per_frame is None:
+            raise ValueError("tokens_per_frame is required")
+        batch_size, total_tokens, latent_dim = latent_tokens.shape
+        num_frames = total_tokens // tokens_per_frame
+        latent = latent_tokens.view(batch_size, num_frames, tokens_per_frame, latent_dim)
+        action_delta = actions.sum(dim=-1).view(batch_size, num_frames, 1, 1)
+        return (latent + action_delta).reshape(batch_size, total_tokens, latent_dim)
 
 
 if __name__ == "__main__":

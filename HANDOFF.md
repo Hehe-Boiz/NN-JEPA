@@ -11,38 +11,49 @@ doc/full_audit_report_20260608.md
 doc/bao_cao_vjepa2_ac_vs_nn_jepa.md
 doc/bao_cao_kha_nang_dung_predictor_ac_official.md
 doc/bao_cao_trien_khai_official_lite_predictor.md
+doc/bao_cao_oom_eval_val_vs_train_batch.md
+doc/bao_cao_jepa_update_20260609_inference.md
+doc/ke_hoach_inference_an_toan_nn_jepa.md
 ```
 
 Kết quả audit mới nhất:
 
 ```text
-official_lite predictor: pass shape/mask/RoPE/loss smoke
+compileall: pass
+unit tests: 46/46 pass
+git diff --check: pass
+smoke train-val-test-checkpoint: pass, loss hữu hạn
+smoke offline CEM planner: pass với max-samples=1, horizon=1, cem-samples=2
+smoke planning plot SVG: pass trên /tmp/nn_jepa_plan_smoke/planning_test.jsonl
+Hydra dry-run rc_jepa_tiny_newdata: pass
+Hydra wandb.continue_run=true/false: pass
+feature cache ViT-B fp32: manifest 100 session, 100 json, 100 npy, missing = 0
+official_lite predictor trước đó: pass shape/mask/RoPE/loss smoke
 action-block causal mask: khớp source vjepa2 cho case thật [4624, 4624]
 RoPE rotation: khớp source vjepa2, max diff = 0.0
-compileall: pass
-unit tests: 41/41 pass
-Hydra dry-run rc_jepa_official_lite_tiny: pass
 git diff --check: pass
 ```
 
-Blocker hiện tại trước khi train thật:
+Blocker môi trường hiện tại trước khi train thật:
 
 ```text
 GPU/CUDA: nvidia-smi fail, chưa giao tiếp được NVIDIA driver
-feature cache ViT-B fp32: manifest có 100 session, cache mới có 63 json + 64 npy
-missing feature json sessions: 37
-partial feature: session_20260607_153652 có .npy nhưng thiếu .json
 ```
 
-Việc cần làm ngay trước train: sửa GPU/driver, rồi chạy extract bù feature cache.
+Việc cần làm ngay trước train: sửa GPU/driver. Feature cache hiện đã đủ theo manifest mới nhất.
 
 `JEPA/` vừa kiểm tra sau khi pull:
 
 ```text
-HEAD: be50793 Add visual navigation (TopoGraph subgoal) + control on current servo
-Thay đổi chính: visual navigation/topological graph, CEM planner, eval/viz navigation,
-config train vjepa_ac_towerpro.yaml và vjepa_ac_mixed.yaml cho servo hiện tại.
-Ảnh hưởng tới NN-JEPA: chưa ảnh hưởng trực tiếp; muốn dùng navigation/planning thì port riêng sau.
+HEAD: e841729 Update HANDOFF: overnight results + inference blockers
+Commit kỹ thuật chính ngay trước đó: 30215d8 Add VJEPA2ACCar
+Thay đổi chính: VJEPA2ACCar patch-token V-JEPA-2-AC cho xe RC, full IMU 10D,
+encode_patch 256px ViT-L, ACClipDataset memmap, CEMPlannerAC, CarDynamics,
+train_ac_car và báo cáo inference blocker.
+Kết quả JEPA báo cáo: VJEPA2ACCar rollout@1 ratio 0.826, rollout@3 ratio 0.775,
+tốt hơn pooled baseline rollout@1 ratio 0.867.
+Ảnh hưởng tới NN-JEPA: chưa ảnh hưởng trực tiếp; nên port theo từng bước, ưu tiên
+offline CEM/eval_goal_reaching trước closed-loop thật.
 ```
 
 Trạng thái data/manifest hiện tại:
@@ -53,10 +64,44 @@ train: 84766 samples, 68139 windows
 val:   9470 samples, 8259 windows
 test:  20310 samples, 16138 windows
 feature cache path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
-feature cache files: 64 .npy + 63 .json
+feature cache files: 100 .npy + 100 .json
 feature metadata: 114546 frame, 576 token/frame, embed_dim 768, fp32
-missing_json_count: 37
-missing_npy_count: 36
+missing_json_count: 0
+missing_npy_count: 0
+```
+
+Ghi chú inference sau khi đọc JEPA mới:
+
+```text
+JEPA chưa có scripts/inference_loop.py hoàn chỉnh.
+pc_stream_view.py hiện chỉ nhận phone -> PC, chưa gửi action ngược.
+robot/capture/controller.py còn UDP cũ; JEPA khuyến nghị đổi sang dongle serial ESP-NOW.
+Hướng đúng cho NN-JEPA: offline CEM planner/eval trước, sau đó live dry-run, cuối cùng mới closed-loop thật.
+Không dùng lẫn checkpoint JEPA VJEPA2ACCar với NN-JEPA hiện tại vì feature format khác:
+  JEPA: ViT-L 256, 256 token/frame, D=1024
+  NN-JEPA: ViT-B 384, 576 token/frame, D=768
+```
+
+NN-JEPA đã có planner offline kiểu JEPA:
+
+```text
+src/tools/rc_jepa_ac_cem_planner.py
+src/tools/plan_rc_jepa_ac_features.py
+src/tools/plot_rc_jepa_planning.py
+```
+
+Planner này load checkpoint predictor + feature cache, lấy context latent và goal
+latent trong sample, chạy CEM trên action raw, normalize action đúng như lúc train,
+rollout predictor rồi ghi JSONL/CSV. Đây là bước offline inference/eval, chưa gửi
+lệnh xuống xe và chưa thay thế live closed-loop.
+
+Tool plot đọc `planning_*.jsonl` và xuất SVG dependency-free:
+
+```text
+latent_l1_comparison.svg
+first_action_planned_vs_groundtruth.svg
+first_action_abs_error.svg
+action_sequence_record_*.svg
 ```
 
 Drive/staging đã audit trước đó:

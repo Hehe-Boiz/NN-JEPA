@@ -12,6 +12,7 @@ from torch import nn
 
 DEFAULT_WANDB_PROJECT = "nn-jepa-rc"
 DEFAULT_WANDB_RESUME = "allow"
+DEFAULT_WANDB_CONTINUE_RUN = True
 DEFAULT_WANDB_WATCH_LOG = "gradients"
 DEFAULT_WANDB_WATCH_FREQ = 200
 DEFAULT_WANDB_GRAD_STATS_EVERY = 20
@@ -25,6 +26,20 @@ def add_wandb_args(parser: Any) -> None:
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--wandb-run-id", default=None)
+    continue_run_group = parser.add_mutually_exclusive_group()
+    continue_run_group.add_argument(
+        "--wandb-continue-run",
+        dest="wandb_continue_run",
+        action="store_true",
+        default=DEFAULT_WANDB_CONTINUE_RUN,
+        help="Reuse the saved W&B run id when resuming from a checkpoint.",
+    )
+    continue_run_group.add_argument(
+        "--no-wandb-continue-run",
+        dest="wandb_continue_run",
+        action="store_false",
+        help="Start a new W&B run even when resuming model weights from a checkpoint.",
+    )
     parser.add_argument(
         "--wandb-resume",
         default=DEFAULT_WANDB_RESUME,
@@ -53,6 +68,8 @@ def init_wandb(args: Any, config: dict[str, Any], job_type: str) -> Any | None:
 
     run_id = resolve_wandb_run_id(args)
     resume_mode = getattr(args, "wandb_resume", DEFAULT_WANDB_RESUME)
+    if not should_continue_wandb_run(args) and resume_mode == "auto":
+        resume_mode = "never"
     if resume_mode == "must" and run_id is None:
         raise ValueError(
             "`--wandb-resume must` requires `--wandb-run-id`, or an existing "
@@ -97,6 +114,12 @@ def read_saved_wandb_run_id(args: Any) -> str | None:
 
 def resolve_wandb_run_id(args: Any) -> str | None:
     explicit_run_id = getattr(args, "wandb_run_id", None)
+    continue_run = should_continue_wandb_run(args)
+    if not continue_run:
+        if explicit_run_id is not None and str(explicit_run_id).strip():
+            raise ValueError("`wandb_run_id` cannot be used when `wandb_continue_run` is false.")
+        return None
+
     if explicit_run_id is not None:
         run_id = str(explicit_run_id).strip()
         if run_id:
@@ -109,6 +132,10 @@ def resolve_wandb_run_id(args: Any) -> str | None:
         return None
 
     return read_saved_wandb_run_id(args)
+
+
+def should_continue_wandb_run(args: Any) -> bool:
+    return bool(getattr(args, "wandb_continue_run", DEFAULT_WANDB_CONTINUE_RUN))
 
 
 def persist_wandb_run_id(args: Any, run: Any | None, job_type: str) -> None:

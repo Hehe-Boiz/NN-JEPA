@@ -206,12 +206,31 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
   train.early_stopping_patience=15 \
   wandb.project=nn-jepa-rc \
   wandb.run_id=8an0pxpo \
+  wandb.continue_run=true \
   wandb.resume=allow \
   wandb.log_every=20 \
   wandb.watch_log=all \
   wandb.watch_freq=100 \
   wandb.grad_stats_every=10 \
   wandb.param_stats_every=100
+```
+
+Nếu muốn resume/fine-tune từ checkpoint nhưng tạo W&B run mới, không nối log vào run cũ:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_newdata \
+  train.resume_from=checkpoints/rc_jepa_ac_vitb_features_newdata_tiny/last.pt \
+  wandb.continue_run=false
+```
+
+Quy tắc:
+
+```text
+train.resume_from != null      -> load checkpoint model/optimizer/scheduler để train tiếp
+wandb.continue_run=true        -> nếu có run id thì nối log vào W&B run cũ
+wandb.continue_run=false       -> vẫn load checkpoint, nhưng tạo W&B run mới
+wandb.run_id=<id>              -> chỉ dùng khi muốn ép nối vào đúng run cụ thể
 ```
 
 Cảnh báo:

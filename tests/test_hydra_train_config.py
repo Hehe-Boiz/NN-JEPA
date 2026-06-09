@@ -51,6 +51,7 @@ class HydraTrainConfigTests(unittest.TestCase):
                     "entity": None,
                     "run_name": None,
                     "run_id": None,
+                    "continue_run": False,
                     "resume": "allow",
                     "mode": "disabled",
                     "tags": ["tiny", "test"],
@@ -72,6 +73,7 @@ class HydraTrainConfigTests(unittest.TestCase):
         self.assertEqual(args.batch_size, 4)
         self.assertEqual(args.device, "cpu")
         self.assertTrue(args.no_wandb)
+        self.assertFalse(args.wandb_continue_run)
         self.assertEqual(args.wandb_tags, ["tiny", "test"])
 
     def test_hydra_config_requires_expected_sections(self) -> None:

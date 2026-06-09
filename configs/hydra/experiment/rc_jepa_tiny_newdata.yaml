@@ -53,6 +53,7 @@ wandb:
   entity: null
   run_name: rc-jepa-tiny-newdata
   run_id: null
+  continue_run: true
   resume: allow
   mode: online
   tags:

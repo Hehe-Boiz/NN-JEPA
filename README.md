@@ -32,37 +32,47 @@ Audit `official_lite` đã kiểm tra:
 - output vẫn là latent patch tokens
 - `teacher_forcing_loss + rollout_loss` chạy được với `tokens_per_frame=576`, `latent_dim=768`
 - `compileall`: pass
-- unit tests: `41/41` pass
+- unit tests: `44/44` pass
+- `git diff --check`: pass
+- smoke planner offline CEM: pass
 - Hydra dry-run `rc_jepa_official_lite_tiny`: pass
 
 Blocker hiện tại trước khi train thật:
 
 ```text
 GPU: nvidia-smi đang fail vì không giao tiếp được NVIDIA driver
-feature cache: manifest có 100 session nhưng cache ViT-B fp32 mới đủ 63 json, thiếu 37 session
+feature cache ViT-B fp32: đủ 100 .npy + 100 .json, missing = 0
 ```
 
-Vì vậy trước khi train thật cần:
+Vì vậy trước khi train thật cần sửa GPU/driver để `nvidia-smi` và `torch.cuda.is_available()` hoạt động. Feature cache hiện đã đủ theo manifest mới nhất.
 
-1. sửa GPU/driver để `nvidia-smi` và `torch.cuda.is_available()` hoạt động
-2. chạy extract bù feature cache cho các session thiếu
+Inference offline kiểu JEPA đã có:
+
+```text
+src/tools/rc_jepa_ac_cem_planner.py
+src/tools/plan_rc_jepa_ac_features.py
+doc/ke_hoach_inference_an_toan_nn_jepa.md
+```
 
 ## Cập nhật repo `JEPA/` vừa kiểm tra
 
 `JEPA/` đang ở commit:
 
 ```text
-be50793 Add visual navigation (TopoGraph subgoal) + control on current servo
+e841729 Update HANDOFF: overnight results + inference blockers
 ```
 
 Các thay đổi chính trong `JEPA/`:
 
+- thêm `VJEPA2ACCar` patch-token cho xe RC: `src/jepa_wm/models/vjepa2_ac_car.py`
+- thêm dataset/feature patch-token: `src/jepa_wm/data/ac_clip.py`, `scripts/encode_patch.py`
+- thêm train AC car: `src/jepa_wm/engine/train_ac_car.py`
+- thêm CEM planner AC và dynamics: `src/jepa_wm/planning/cem.py`, `src/jepa_wm/planning/dynamics.py`
 - thêm phần visual navigation/topological graph: `src/jepa_wm/nav/graph.py`, `scripts/build_graph.py`, `scripts/eval_navigation.py`, `scripts/eval_goal_reaching.py`, `scripts/viz_route.py`
-- cập nhật planner CEM ở `src/jepa_wm/planning/cem.py`
 - thêm/cập nhật config train cho servo hiện tại: `configs/train/vjepa_ac_towerpro.yaml`, `configs/train/vjepa_ac_mixed.yaml`
 - cập nhật `robot/tools/pull_drive.py` và một số docs/eval script
 
-Điểm quan trọng: đây là cập nhật của repo phần cứng/recorder/sync/navigation. Code train hiện tại của NN-JEPA không tự thay đổi theo `JEPA/`; nếu muốn dùng ý tưởng graph/planning từ `JEPA/` thì cần port riêng sau.
+Điểm quan trọng: code train hiện tại của NN-JEPA không tự thay đổi theo `JEPA/`. Phần đã port sang NN-JEPA hiện là planner CEM offline trên feature cache, không phải closed-loop phần cứng.
 
 ## Cấu trúc dữ liệu
 
@@ -755,7 +765,16 @@ W&B resume cùng một run:
 - khi chạy lại với cùng `--output-dir` và có `--resume-from`, script tự đọc file này và gọi W&B với `id=<run_id>` + `resume="allow"`
 - nghĩa là lệnh resume ở trên sẽ nối log vào cùng run W&B, không tự tách run mới nữa
 - khi resume cùng run, giữ cùng `--wandb-project` và `--wandb-entity` với run gốc
-- nếu muốn resume checkpoint nhưng cố tình tạo W&B run mới, thêm `--wandb-resume never`
+- nếu muốn resume checkpoint nhưng cố tình tạo W&B run mới, thêm `--no-wandb-continue-run`
+
+Với Hydra:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_newdata \
+  train.resume_from=checkpoints/rc_jepa_ac_vitb_features_newdata_tiny/last.pt \
+  wandb.continue_run=false
+```
 
 Nếu run W&B cũ được tạo trước khi có file `wandb_run_id.txt`, lấy run id ở cuối URL W&B rồi truyền thủ công:
 
@@ -823,6 +842,81 @@ Nếu muốn lưu cả tensor latent dự đoán và target cho từng sample, t
 ```
 
 Lưu ý: inference hiện tại là inference của **world model latent**, tức là dự đoán latent frame tương lai từ latent hiện tại + state + action. Nó không sinh trực tiếp `steering_cmd_t`/`throttle_cmd_t`.
+
+Chạy planner offline kiểu JEPA để sinh action bằng CEM:
+
+```bash
+PYTHONPATH=src python3 -m tools.plan_rc_jepa_ac_features \
+  --checkpoint checkpoints/rc_jepa_ac_vitb_features_newdata_tiny/best.pt \
+  --features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --manifest-dir data/processed/manifests \
+  --split test \
+  --max-samples 32 \
+  --horizon 2 \
+  --goal-offset 2 \
+  --cem-samples 128 \
+  --cem-elites 16 \
+  --cem-iters 4 \
+  --num-workers 8
+```
+
+Nếu checkpoint mới chưa train xong và chỉ muốn smoke/demo bằng checkpoint cũ đang có trên máy, đổi checkpoint thành:
+
+```bash
+--checkpoint checkpoints/rc_jepa_ac_vitb_features/best.pt
+```
+
+Lưu ý: checkpoint cũ có thể chạy được nếu feature shape khớp, nhưng không nên dùng kết quả đó để kết luận chất lượng trên data mới.
+
+Planner offline sẽ:
+
+- lấy latent frame đầu `z_t` từ feature cache
+- lấy goal latent `z_{t+k}` trong cùng sample
+- sample nhiều chuỗi action raw `[steering_cmd_t, throttle_cmd_t]`
+- normalize action đúng như lúc train trước khi đưa vào predictor
+- rollout predictor để dự đoán latent tương lai
+- chọn chuỗi action có latent cuối gần goal latent nhất
+- ghi kết quả vào `checkpoints/.../planning/planning_test.jsonl` và `planning_test.csv`
+
+Ý nghĩa output planner:
+
+```text
+planned_first_*        action đầu tiên CEM muốn chạy
+groundtruth_first_*    action thật trong log tại cùng frame
+planned_final_l1       latent L1 tới goal khi dùng action planner
+groundtruth_final_l1   latent L1 tới goal khi dùng action thật
+zero_action_final_l1   latent L1 tới goal nếu giữ action bằng 0
+```
+
+Không nên hiểu `planned_first_*` bắt buộc phải giống ground-truth. Cùng một goal latent có thể đạt bằng nhiều action sequence khác nhau. Chỉ số cần xem trước là `planned_final_l1` có hợp lý và có tốt hơn `zero_action_final_l1` không.
+
+Vẽ đồ thị từ kết quả planner:
+
+```bash
+PYTHONPATH=src python3 -m tools.plot_rc_jepa_planning \
+  --planning-jsonl checkpoints/rc_jepa_ac_vitb_features_newdata_tiny/planning/planning_test.jsonl
+```
+
+Tool này không cần `matplotlib`; nó ghi SVG vào:
+
+```text
+checkpoints/rc_jepa_ac_vitb_features_newdata_tiny/planning/plots/
+```
+
+Các đồ thị chính:
+
+- `latent_l1_comparison.svg`: so sánh `planned_final_l1`, `groundtruth_final_l1`, `zero_action_final_l1`.
+- `first_action_planned_vs_groundtruth.svg`: so sánh action đầu tiên planner sinh với action thật.
+- `first_action_abs_error.svg`: sai số tuyệt đối của action đầu tiên.
+- `action_sequence_record_*.svg`: chuỗi action planner vs ground-truth theo từng sample.
+
+Lưu ý an toàn về inference:
+
+- `tools.infer_rc_jepa_ac_features` chỉ kiểm tra dự đoán latent theo action có sẵn trong data.
+- `tools.plan_rc_jepa_ac_features` mới là bước sinh action offline bằng world model + planner.
+- Đây vẫn chưa phải closed-loop thật; script chưa gửi lệnh xuống xe.
+- Trước khi closed-loop cần thêm live dry-run, watchdog, neutral fallback, clamp throttle/steering và kênh gửi lệnh phần cứng ổn định.
+- Không trộn feature/checkpoint JEPA `ViT-L 256, 256 token/frame, D=1024` với NN-JEPA `ViT-B 384, 576 token/frame, D=768`.
 
 Lưu ý khi dùng feature cache:
 
@@ -1042,6 +1136,8 @@ src/tools/extract_vjepa_features.py
 src/tools/train_rc_jepa_ac_features.py
 src/tools/eval_rc_jepa_ac_features.py
 src/tools/infer_rc_jepa_ac_features.py
+src/tools/plan_rc_jepa_ac_features.py
+src/tools/rc_jepa_ac_cem_planner.py
 src/tools/rc_jepa_ac_feature_runtime.py
 ```
 

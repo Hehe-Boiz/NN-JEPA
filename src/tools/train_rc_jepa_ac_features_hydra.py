@@ -68,6 +68,7 @@ def build_train_args(cfg: Any) -> Namespace:
     args.wandb_entity = optional_str(wandb_cfg.get("entity", args.wandb_entity))
     args.wandb_run_name = optional_str(wandb_cfg.get("run_name", args.wandb_run_name))
     args.wandb_run_id = optional_str(wandb_cfg.get("run_id", args.wandb_run_id))
+    args.wandb_continue_run = bool(wandb_cfg.get("continue_run", args.wandb_continue_run))
     args.wandb_resume = str(wandb_cfg.get("resume", args.wandb_resume))
     args.wandb_mode = str(wandb_cfg.get("mode", args.wandb_mode))
     args.wandb_tags = list(wandb_cfg.get("tags", args.wandb_tags))
