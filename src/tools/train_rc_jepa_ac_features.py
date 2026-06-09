@@ -524,6 +524,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     history,
                     phase="train_complete_waiting_val",
                 )
+            optimizer.zero_grad(set_to_none=True)
             maybe_cleanup_cuda()
             with torch.no_grad():
                 val_metrics, _ = run_epoch(
@@ -635,6 +636,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
         best_checkpoint = torch.load(args.output_dir / "best.pt", map_location=device)
         predictor.load_state_dict(best_checkpoint["predictor_state_dict"])
+        optimizer.zero_grad(set_to_none=True)
         maybe_cleanup_cuda()
         with torch.no_grad():
             test_metrics, _ = run_epoch(

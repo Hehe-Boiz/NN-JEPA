@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import sys
 import math
 from pathlib import Path
@@ -43,6 +44,28 @@ PREDICTOR_SIZE_PRESETS = {
         "predictor_heads": DEFAULT_PREDICTOR_HEADS,
     },
 }
+
+
+@contextmanager
+def torch_transformer_eval_fastpath_disabled(disable: bool):
+    """Avoid eval-only native Transformer fastpath memory spikes on long token sequences."""
+    if not disable:
+        yield
+        return
+
+    mha_backend = getattr(torch.backends, "mha", None)
+    get_fastpath_enabled = getattr(mha_backend, "get_fastpath_enabled", None)
+    set_fastpath_enabled = getattr(mha_backend, "set_fastpath_enabled", None)
+    if get_fastpath_enabled is None or set_fastpath_enabled is None:
+        yield
+        return
+
+    previous = bool(get_fastpath_enabled())
+    set_fastpath_enabled(False)
+    try:
+        yield
+    finally:
+        set_fastpath_enabled(previous)
 
 
 def apply_predictor_size_preset(args: Any) -> None:
@@ -309,7 +332,8 @@ class SimpleACPredictor(nn.Module):
             tokens_per_step=tokens_per_frame + self.cond_tokens,
             device=sequence.device,
         )
-        sequence = self.blocks(sequence, mask=mask)
+        with torch_transformer_eval_fastpath_disabled(disable=not self.training):
+            sequence = self.blocks(sequence, mask=mask)
         sequence = sequence.view(batch_size, num_frames, tokens_per_frame + self.cond_tokens, self.predictor_dim)
         predicted = sequence[:, :, self.cond_tokens :, :].flatten(1, 2)
         predicted = self.output_proj(self.norm(predicted))

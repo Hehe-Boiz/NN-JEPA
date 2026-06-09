@@ -582,6 +582,8 @@ def main() -> None:
                 wandb_param_stats_every=args.wandb_param_stats_every,
             )
 
+            optimizer.zero_grad(set_to_none=True)
+            maybe_cleanup_cuda()
             with torch.no_grad():
                 val_metrics, _ = run_epoch(
                     model=model,
@@ -705,6 +707,8 @@ def main() -> None:
         best_checkpoint = torch.load(args.output_dir / "best.pt", map_location=device)
         model.predictor.load_state_dict(best_checkpoint["predictor_state_dict"])
 
+        optimizer.zero_grad(set_to_none=True)
+        maybe_cleanup_cuda()
         with torch.no_grad():
             test_metrics, _ = run_epoch(
                 model=model,

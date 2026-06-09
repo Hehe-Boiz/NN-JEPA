@@ -1,0 +1,67 @@
+# @package _global_
+
+output_dir: checkpoints/rc_jepa_ac_vitb_features_newdata
+
+runtime:
+  dry_run: false
+  require_cuda: true
+
+data:
+  features_dir: data/processed/features/vjepa2_1_vitb_384_ema_fp32
+  manifest_dir: data/processed/manifests
+  state_columns:
+    - yaw_rate_t
+    - accel_x_t
+    - accel_y_t
+    - steering_last_t
+    - throttle_last_t
+  action_columns:
+    - steering_cmd_t
+    - throttle_cmd_t
+  raw_frames_per_sample: 8
+  sequence_stride: 1
+  auto_steps: 2
+
+model:
+  type: simple
+  size: base
+  predictor_dim: null
+  predictor_depth: null
+  predictor_heads: null
+  dropout: 0.0
+
+train:
+  epochs: 100
+  batch_size: 10
+  eval_batch_size: 2
+  num_workers: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  warmup_epochs: 4
+  warmup_start_factor: 0.1
+  min_lr_ratio: 0.1
+  early_stopping_patience: 15
+  resume_from: null
+  seed: 42
+  device: auto
+  no_progress: false
+
+wandb:
+  disabled: false
+  project: nn-jepa-rc
+  entity: null
+  run_name: rc-jepa-base-newdata
+  run_id: null
+  resume: allow
+  mode: online
+  tags:
+    - base
+    - hydra
+    - new-data
+    - simple
+  log_every: 20
+  watch_log: all
+  watch_freq: 100
+  grad_stats_every: 10
+  param_stats_every: 100
