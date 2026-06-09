@@ -129,6 +129,7 @@ class RCJepaACFeatureSequenceDataset(Dataset):
             "actions": torch.tensor(action_values, dtype=torch.float32),
             "sample_id": f"{first_sample['sample_id']}__to__{last_sample['sample_id']}",
             "session_id": session_id,
+            "data_domain": first_sample.get("data_domain", "unknown"),
             "frame_indices": torch.tensor([sample["frame_index"] for sample in sequence], dtype=torch.long),
             "timestamps_sec": torch.tensor(
                 [timestamp_to_float(sample.get("timestamp_sec")) for sample in sequence],
@@ -192,6 +193,7 @@ def create_ac_feature_sequence_dataloaders(
     target_fps: float = settings.AC_TARGET_FPS,
     state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
     action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
+    include_test: bool = True,
 ) -> dict[str, DataLoader]:
     batch_size = batch_size or settings.BATCH_SIZE
     eval_batch_size = eval_batch_size or settings.AC_EVAL_BATCH_SIZE
@@ -216,6 +218,7 @@ def create_ac_feature_sequence_dataloaders(
         else None
     )
 
+    splits = ("train", "val", "test") if include_test else ("train", "val")
     datasets = {
         split: RCJepaACFeatureSequenceDataset(
             split=split,
@@ -230,10 +233,10 @@ def create_ac_feature_sequence_dataloaders(
             state_normalizer=state_normalizer,
             action_normalizer=action_normalizer,
         )
-        for split in ("train", "val", "test")
+        for split in splits
     }
 
-    return {
+    dataloaders = {
         "train": DataLoader(
             datasets["train"],
             batch_size=batch_size,
@@ -246,10 +249,12 @@ def create_ac_feature_sequence_dataloaders(
             shuffle=False,
             **loader_kwargs,
         ),
-        "test": DataLoader(
+    }
+    if include_test:
+        dataloaders["test"] = DataLoader(
             datasets["test"],
             batch_size=eval_batch_size,
             shuffle=False,
             **loader_kwargs,
-        ),
-    }
+        )
+    return dataloaders

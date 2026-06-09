@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -73,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         help="Safe preset that maps encoder/checkpoint key/checkpoint path/default feature dir.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--seed-from-features-dir",
+        type=Path,
+        default=None,
+        help="Optional existing feature cache to symlink compatible session .npy/.json files from.",
+    )
     parser.add_argument("--vjepa-root", type=Path, default=settings.REPO_ROOT / "vjepa2")
     parser.add_argument("--vjepa-checkpoint", type=Path, default=None)
     parser.add_argument("--checkpoint-key", default=None)
@@ -359,6 +366,120 @@ def cache_status_summary(
     return summary
 
 
+def seed_feature_cache_from_dir(
+    seed_dir: Path | None,
+    output_dir: Path,
+    grouped: dict[str, list[dict[str, Any]]],
+    args: argparse.Namespace,
+    tokens_per_frame: int,
+    embed_dim: int,
+    dtype: np.dtype,
+    overwrite: bool,
+) -> dict[str, int]:
+    summary = {"seeded": 0, "already_present": 0, "missing": 0, "incompatible": 0, "skipped": 0}
+    if seed_dir is None:
+        return summary
+    if overwrite:
+        summary["skipped"] = len(grouped)
+        return summary
+    if seed_dir.resolve() == output_dir.resolve():
+        summary["skipped"] = len(grouped)
+        return summary
+
+    source_sessions_dir = seed_dir / FEATURE_SESSIONS_DIR_NAME
+    target_sessions_dir = output_dir / FEATURE_SESSIONS_DIR_NAME
+    if not source_sessions_dir.exists():
+        summary["missing"] = len(grouped)
+        return summary
+
+    seed_metadata = read_existing_metadata(seed_dir)
+    if seed_metadata is None or not seed_metadata_is_compatible_for_seed(
+        seed_metadata=seed_metadata,
+        args=args,
+        tokens_per_frame=tokens_per_frame,
+        embed_dim=embed_dim,
+        dtype=dtype,
+    ):
+        summary["incompatible"] = len(grouped)
+        return summary
+
+    for session_id, session_samples in grouped.items():
+        target_npy = target_sessions_dir / f"{session_id}.npy"
+        target_json = target_sessions_dir / f"{session_id}.json"
+        if target_npy.exists() and target_json.exists():
+            summary["already_present"] += 1
+            continue
+
+        source_npy = source_sessions_dir / f"{session_id}.npy"
+        source_json = source_sessions_dir / f"{session_id}.json"
+        if not source_npy.exists() or not source_json.exists():
+            summary["missing"] += 1
+            continue
+
+        try:
+            existing = np.load(source_npy, mmap_mode="r")
+        except (OSError, ValueError):
+            summary["incompatible"] += 1
+            continue
+        expected_shape = (len(session_samples), tokens_per_frame, embed_dim)
+        if tuple(existing.shape) != expected_shape or np.dtype(existing.dtype) != dtype:
+            summary["incompatible"] += 1
+            continue
+
+        for source_path, target_path in ((source_npy, target_npy), (source_json, target_json)):
+            if target_path.exists():
+                continue
+            os.symlink(source_path.resolve(), target_path)
+        summary["seeded"] += 1
+    return summary
+
+
+def seed_metadata_is_compatible_for_seed(
+    seed_metadata: dict[str, Any],
+    args: argparse.Namespace,
+    tokens_per_frame: int,
+    embed_dim: int,
+    dtype: np.dtype,
+) -> bool:
+    """Check encoder-level metadata before reusing per-session feature files.
+
+    Manifest path, split names, and session count may differ because a mixed
+    experiment intentionally reuses only overlapping current-servo sessions.
+    Encoder identity and tensor layout must still match exactly.
+    """
+    expected_values = {
+        "format_version": 1,
+        "feature_layout": "frame_tokens",
+        "tokens_per_frame": tokens_per_frame,
+        "embed_dim": embed_dim,
+        "dtype": "fp16" if dtype == np.dtype(np.float16) else "fp32",
+        "encoder_name": args.encoder,
+        "checkpoint_key": args.checkpoint_key,
+        "image_size": args.image_size,
+        "patch_size": args.patch_size,
+        "tubelet_size": args.tubelet_size,
+        "normalization_mean": list(settings.NORMALIZE_MEAN),
+        "normalization_std": list(settings.NORMALIZE_STD),
+    }
+    for key, expected_value in expected_values.items():
+        if seed_metadata.get(key) != expected_value:
+            return False
+    if not checkpoint_paths_match(seed_metadata.get("checkpoint_path"), args.vjepa_checkpoint):
+        return False
+    return True
+
+
+def checkpoint_paths_match(seed_value: Any, request_value: Path) -> bool:
+    if seed_value in (None, ""):
+        return False
+    seed_path = Path(str(seed_value))
+    request_path = Path(request_value)
+    try:
+        return seed_path.resolve() == request_path.resolve()
+    except OSError:
+        return str(seed_path) == str(request_path)
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -435,7 +556,20 @@ def main() -> None:
     write_json(args.output_dir / FEATURE_METADATA_NAME, metadata)
     print(json.dumps(metadata, indent=2), flush=True)
 
-    feature_summary = {"extracted": 0, "skipped_compatible": 0}
+    seed_summary = seed_feature_cache_from_dir(
+        seed_dir=args.seed_from_features_dir,
+        output_dir=args.output_dir,
+        grouped=grouped,
+        args=args,
+        tokens_per_frame=encoder.tokens_per_frame,
+        embed_dim=encoder.embed_dim,
+        dtype=dtype,
+        overwrite=args.overwrite,
+    )
+    if args.seed_from_features_dir is not None:
+        print(json.dumps({"feature_seed_summary": seed_summary}, indent=2), flush=True)
+
+    feature_summary = {"extracted": 0, "skipped_compatible": 0, "seeded": seed_summary["seeded"]}
     total_sessions = len(grouped)
     with torch.no_grad():
         for index, (session_id, session_samples) in enumerate(tqdm(grouped.items(), desc="sessions"), start=1):

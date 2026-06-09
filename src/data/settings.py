@@ -203,12 +203,14 @@ NORMALIZE_STD = (0.229, 0.224, 0.225)
 
 
 # ---------------------------------------------------------------------------
-# Train / val / test split
+# Train / val split. test.jsonl can be written as a val alias for old eval tools.
 # Split by session to avoid trajectory leakage.
 # ---------------------------------------------------------------------------
 TRAIN_RATIO = 0.7
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
+USE_TEST_SPLIT = False
+ALIAS_TEST_TO_VAL = True
 RANDOM_SEED = 42
 
 

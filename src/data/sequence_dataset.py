@@ -167,6 +167,7 @@ class RCJepaACSequenceDataset(Dataset):
             "actions": actions_tensor,
             "sample_id": f"{first_sample['sample_id']}__to__{last_sample['sample_id']}",
             "session_id": first_sample["session_id"],
+            "data_domain": first_sample.get("data_domain", "unknown"),
             "frame_indices": torch.tensor([sample["frame_index"] for sample in sequence], dtype=torch.long),
             "timestamps_sec": torch.tensor(
                 [timestamp_to_float(sample.get("timestamp_sec")) for sample in sequence],

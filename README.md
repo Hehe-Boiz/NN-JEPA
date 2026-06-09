@@ -32,7 +32,7 @@ Audit `official_lite` đã kiểm tra:
 - output vẫn là latent patch tokens
 - `teacher_forcing_loss + rollout_loss` chạy được với `tokens_per_frame=576`, `latent_dim=768`
 - `compileall`: pass
-- unit tests: `44/44` pass
+- unit tests: `47/47` pass
 - `git diff --check`: pass
 - smoke planner offline CEM: pass
 - Hydra dry-run `rc_jepa_official_lite_tiny`: pass
@@ -166,8 +166,16 @@ Pipeline sẽ:
 - đọc toàn bộ session trong `data/raw`
 - resize ảnh
 - ghi ảnh processed vào `data/processed/images`
-- tạo manifest train/val/test
+- tạo manifest train/val; `test.jsonl` chỉ là alias của `val.jsonl` để tương thích tool eval/infer cũ
 - ghi report vào `data/processed/reports/preprocess_report.json`
+
+Nếu đang có manifest cũ đã từng chia test độc lập, chuyển sang chế độ mới bằng:
+
+```bash
+PYTHONPATH=src python3 -m tools.drop_test_split --manifest-dir data/processed/manifests
+```
+
+Tool này idempotent: chạy lại nhiều lần không nhân đôi val.
 
 ### 2. Mở web xem session như video
 
@@ -190,7 +198,7 @@ Web viewer hỗ trợ:
 - chỉnh FPS
 - phím tắt `Space`, `Left`, `Right`
 - bấm `Sync Drive` để kéo zip mới từ Drive, extract session mới và sync sensor
-- bấm `Preprocess` để resize ảnh, tạo lại manifest train/val/test sau khi sync xong
+- bấm `Preprocess` để resize ảnh, tạo lại manifest train/val sau khi sync xong
 - chọn `Feature model`, rồi bấm `Extract V-JEPA Features` để chạy feature extractor từ web
 - xem thanh tiến trình job trong panel `Data Ops`
 - xem log job trực tiếp trong panel `Job Log`
@@ -211,7 +219,7 @@ Lưu ý khi chạy job từ web:
 Thứ tự dùng 3 chức năng web:
 
 1. Bấm `Sync Drive` khi Google Drive có session mới. Nút này chỉ kéo zip mới, extract session mới vào `data/raw`, rồi tạo `actions_synced.csv`/`imu_synced.csv` nếu thiếu.
-2. Bấm `Preprocess` sau khi sync xong. Nút này resize ảnh, làm sạch data, chia train/val/test và tạo lại manifest.
+2. Bấm `Preprocess` sau khi sync xong. Nút này resize ảnh, làm sạch data, chia train/val và tạo lại manifest. `test.jsonl` được ghi bằng chính `val` để tool cũ vẫn chạy được, nhưng không còn test split độc lập.
 3. Chọn `Feature model`, rồi bấm `Extract V-JEPA Features` sau khi preprocess xong. Nút này encode frame bằng V-JEPA 2.1 và lưu feature cache; session nào đã extract đúng rồi thì skip.
 
 ### 3. Export nhanh 1 session ra GIF
@@ -507,11 +515,11 @@ Với manifest hiện tại và `batch_size=10`:
 
 ```text
 train_samples = 84,766
-val_samples = 9,470
-test_samples = 20,310
+val_samples = 29,780
+test_samples = 29,780  # alias của val, không phải test độc lập
 train_windows = 68,139
-val_windows = 8,259
-test_windows = 16,138
+val_windows = 24,397
+test_windows = 24,397  # alias của val, không phải test độc lập
 steps_per_epoch = 6,814
 warmup_steps = 27,256
 ```
@@ -549,7 +557,7 @@ run_config.json
 history.json
 last.pt
 best.pt
-test_metrics.json
+final_metrics.json
 epochs/epoch_001.pt
 epochs/epoch_002.pt
 ...
@@ -611,6 +619,12 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --wandb-watch-freq 100 \
   --wandb-grad-stats-every 10 \
   --wandb-param-stats-every 100
+```
+
+Mặc định `tools.train_rc_jepa_ac_features` bỏ phase `test` cuối train. Script chỉ chạy `val` sau mỗi epoch, chọn `best.pt` theo `val/loss`, rồi ghi `final_metrics.json`. Vì hiện tại không có test split độc lập, `test.jsonl` chỉ là alias của `val.jsonl`; nếu thêm `--run-test` thì kết quả `test/*` cũng chính là đo lại trên val.
+
+```bash
+--run-test
 ```
 
 Lệnh train bản `tiny` để thử nghiệm nhanh trước:
@@ -684,7 +698,7 @@ Cấu hình trên giữ:
 
 - `fp32` latent cache để tránh giảm precision do lưu feature.
 - full patch token `576 token/frame`, không pooling, không giảm token.
-- `train batch_size = 10`, `val/test batch_size = 2`, predictor mặc định `20.01M params`.
+- `train batch_size = 10`, `val batch_size = 2`, predictor mặc định `20.01M params`.
 - W&B log đầy đủ loss, gradient, parameter histogram và gradient scalar stats.
 - mặc định script hiện dùng `num_workers = 4`, `prefetch_factor = 4`
 
@@ -721,7 +735,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
 Điểm chính của lệnh trên:
 
 - vẫn giữ `fp32`, full token `576 token/frame`, predictor mặc định `20.01M params`
-- không giảm `train batch_size`, chỉ giảm `val/test` xuống `2` cho an toàn hơn
+- không giảm `train batch_size`, chỉ giữ `val` xuống `2` cho an toàn hơn
 - chỉ giảm tải W&B và thêm `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` để giảm rủi ro phân mảnh VRAM
 
 Resume train từ feature cache:
@@ -815,6 +829,8 @@ Nếu muốn eval cả `train`, `val`, `test`:
 ```bash
 --split all
 ```
+
+Lưu ý: `--split test` hiện không phải test độc lập. Nó đọc `test.jsonl`, nhưng file này là alias của `val.jsonl`, nên chỉ dùng để tương thích quy trình cũ hoặc để tạo file kết quả tên `eval_test.json`.
 
 Chạy inference từ checkpoint:
 
@@ -965,6 +981,88 @@ PYTHONPATH=src python3 -m tools.extract_vjepa_features \
 
 Nếu đổi `--dtype`, `--encoder-preset`, `--encoder`, `--image-size`, `--patch-size` hoặc `--tubelet-size`, nên dùng output dir riêng. Khi không truyền `--output-dir`, script sẽ tự chọn dir riêng theo preset/dtype. Script extract cũng kiểm tra shape/dtype của cache cũ; nếu không khớp nó sẽ báo lỗi thay vì âm thầm dùng nhầm feature.
 
+### 7. Experiment dùng thêm data servo cũ
+
+Experiment servo cũ được tách riêng khỏi baseline. Không copy data cũ vào `data/raw` và không ghi đè `data/processed`.
+
+Data servo cũ hiện nằm ở:
+
+```text
+JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV/
+```
+
+Build mixed dataset, gồm `data/raw` hiện tại + servo cũ:
+
+```bash
+PYTHONPATH=src python3 -m tools.build_servo_experiment_dataset \
+  --mode mixed \
+  --experiment-root data/experiments/servo_old_mix_v1 \
+  --no-test-split
+```
+
+`--no-test-split` là default hiện tại. Khi không chia test độc lập, tool vẫn ghi `test.jsonl` bằng chính `val.jsonl` để các lệnh `--split test` cũ không bị hỏng.
+
+Build old-only dataset, chỉ gồm servo cũ:
+
+```bash
+PYTHONPATH=src python3 -m tools.build_servo_experiment_dataset \
+  --mode old-only \
+  --experiment-root data/experiments/servo_old_only_v1 \
+  --no-test-split
+```
+
+Sau khi GPU hoạt động, extract feature cho mixed experiment:
+
+```bash
+PYTHONPATH=src python3 -m tools.extract_vjepa_features \
+  --vjepa-root vjepa2 \
+  --encoder-preset vitb_384 \
+  --manifest-dir data/experiments/servo_old_mix_v1/processed/manifests \
+  --splits train val \
+  --output-dir data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp32 \
+  --seed-from-features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp32 \
+  --batch-size 32 \
+  --dtype fp32 \
+  --splits train val
+```
+
+`--seed-from-features-dir` sẽ reuse feature của session hiện tại nếu metadata encoder khớp, rồi chỉ encode thêm session servo cũ.
+
+Extract feature cho old-only:
+
+```bash
+PYTHONPATH=src python3 -m tools.extract_vjepa_features \
+  --vjepa-root vjepa2 \
+  --encoder-preset vitb_384 \
+  --manifest-dir data/experiments/servo_old_only_v1/processed/manifests \
+  --output-dir data/experiments/servo_old_only_v1/features/vjepa2_1_vitb_384_ema_fp32 \
+  --batch-size 32 \
+  --dtype fp32 \
+  --splits train val
+```
+
+Train mixed tiny:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_mix_oldservo_frame_stride2
+```
+
+Train old-only tiny:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_tiny_oldservo_frame_stride2
+```
+
+Các config này đang dùng `simple tiny`, `raw_frames_per_sample=8`, `frame_stride=2`, `batch_size=32`, `eval_batch_size=2`. Nên train fresh, không resume checkpoint cũ, vì data distribution và split đã đổi.
+
+Báo cáo chi tiết:
+
+```text
+doc/bao_cao_trien_khai_experiment_servo_cu.md
+```
+
 ## State và action hiện tại
 
 Schema đầy đủ đang bám theo mục tiêu ban đầu:
@@ -1015,8 +1113,8 @@ Sau lần preprocess gần nhất:
 ```text
 raw_sessions: 100
 train: 84766 samples, 68139 windows
-val:   9470 samples, 8259 windows
-test:  20310 samples, 16138 windows
+val:   29780 samples, 24397 windows
+test:  29780 samples, 24397 windows  # alias của val
 ```
 
 Report chi tiết nằm ở:
@@ -1038,13 +1136,17 @@ raw train sessions: 100
 raw session cũ 20260605 trong data/raw: 0
 actions_synced.csv / imu_synced.csv thiếu: 0
 manifest missing frame_path: 0
-split overlap train/val/test: 0
-feature cache: 64 .npy + 63 .json
+train/val split độc lập theo session; test split không độc lập vì test.jsonl là alias của val.jsonl
+feature cache baseline: 100 .npy + 100 .json
 feature metadata: 114,546 frame, 576 token/frame, embed_dim 768, fp32
-feature cache missing json sessions: 37
-feature cache partial: session_20260607_153652 có .npy nhưng thiếu .json
+feature cache missing sessions: 0
+servo_old_mix_v1: 128 session selected, 114,579 train samples, 49,226 val samples, 49,226 test samples alias val
+servo_old_only_v1: 28 session selected, 36,564 train samples, 12,695 val samples, 12,695 test samples alias val
+servo_old frame_stride=2 windows:
+  mixed train/val/test = 79,765 / 34,926 / 34,926 alias val
+  old-only train/val/test = 25,549 / 8,865 / 8,865 alias val
 web smoke test: /, /app.js, /styles.css, /api/sessions, /api/jobs đều HTTP 200
-unit tests: 41/41 pass
+unit tests: 47/47 pass
 ```
 
 Diễn giải `65` và `63`:
@@ -1153,7 +1255,7 @@ Các nhóm biến chính:
 
 - đường dẫn data
 - kích thước ảnh
-- split train / val / test
+- split train / val; `test.jsonl` là alias của val để tương thích tool cũ
 - stride lấy frame
 - tên cột state / action
 - ngưỡng outlier
@@ -1191,7 +1293,9 @@ http://127.0.0.1:8765/api/jobs
 
 ## Progress Bar Khi Train
 
-`tools.train_rc_car`, `tools.train_rc_jepa_ac` và `tools.train_rc_jepa_ac_features` đều chạy `val` ngay sau mỗi epoch và hiển thị progress bar bằng `tqdm` cho `train`, `val`, `test`.
+`tools.train_rc_car`, `tools.train_rc_jepa_ac` và `tools.train_rc_jepa_ac_features` đều chạy `val` ngay sau mỗi epoch và hiển thị progress bar bằng `tqdm`.
+
+Riêng `tools.train_rc_jepa_ac_features` mặc định bỏ phase `test` cuối train; chỉ chạy `train` và `val`. Muốn chạy test cuối train thì thêm `--run-test`, hoặc chạy `tools.eval_rc_jepa_ac_features` riêng sau khi có `best.pt`.
 
 Nếu muốn tắt progress bar:
 
@@ -1210,12 +1314,15 @@ metrics: train/*, val/*, test/*, best/val_loss, lr
 
 Tất cả metric/loss mà loop đang trả về đều được log lên W&B.
 
+Với `tools.train_rc_jepa_ac_features`, mặc định chỉ có `train/*`, `train_batch/*`, `val/*`, `best/*`, `lr`. `test/*` chỉ có nếu bật `--run-test` hoặc chạy eval/test riêng.
+
 Ngoài metric theo epoch, loop train còn log thêm `train_batch/*` theo batch để nhìn thấy loss curve ngay trong lúc epoch đang chạy.
 
 Trục step trên W&B:
 
 - `train_batch/*` log theo `global_step`.
-- `train/*`, `val/*`, `test/*`, `best/*` cũng log theo `global_step`.
+- `train/*`, `val/*`, `best/*` cũng log theo `global_step`.
+- `test/*` chỉ log khi có chạy test.
 - Không dùng `epoch` làm W&B step, để tránh trường hợp step đi lùi và W&B bỏ qua metric.
 - Metric vẫn có field `epoch`, nên vẫn lọc/xem theo epoch được.
 

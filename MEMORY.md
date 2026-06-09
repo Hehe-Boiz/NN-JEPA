@@ -14,13 +14,14 @@ doc/bao_cao_trien_khai_official_lite_predictor.md
 doc/bao_cao_oom_eval_val_vs_train_batch.md
 doc/bao_cao_jepa_update_20260609_inference.md
 doc/ke_hoach_inference_an_toan_nn_jepa.md
+doc/bao_cao_trien_khai_experiment_servo_cu.md
 ```
 
 Kết quả audit mới nhất:
 
 ```text
 compileall: pass
-unit tests: 46/46 pass
+unit tests: 47/47 pass
 git diff --check: pass
 smoke train-val-test-checkpoint: pass, loss hữu hạn
 smoke offline CEM planner: pass với max-samples=1, horizon=1, cem-samples=2
@@ -63,8 +64,8 @@ data/raw: 100 session
 data/raw session cũ 20260605: không còn trong data/raw theo audit trước
 processed manifest:
   train: 84766 samples, 68139 windows
-  val:   9470 samples, 8259 windows
-  test:  20310 samples, 16138 windows
+  val:   29780 samples, 24397 windows
+  test:  29780 samples, 24397 windows  # alias của val
 feature cache:
   path: data/processed/features/vjepa2_1_vitb_384_ema_fp32
   files: 100 .npy + 100 .json
@@ -117,7 +118,7 @@ JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV:
   28 session cũ 20260605
   53403 file
   actions_synced.csv / imu_synced.csv đủ 28/28
-  không nằm trong data/raw, không dùng train hiện tại
+  không nằm trong data/raw baseline
 ```
 
 `data servo cũ KDS 680HV` đã được khôi phục thủ công từ 3 zip:
@@ -177,7 +178,40 @@ Feature extractor hiện có fast-skip:
 
 - Nếu session đã có `.npy + .json` đúng shape/dtype thì skip session đó.
 - Nếu toàn bộ cache đầy đủ và metadata khớp thì kết thúc sớm, không load encoder/checkpoint.
-- Hiện cache chưa đầy đủ vì thiếu 37 session theo manifest mới, cần chạy extract bù sau khi GPU hoạt động.
+- Cache baseline ViT-B fp32 hiện đủ 100 session theo manifest baseline.
+- Với experiment mixed servo cũ, extractor có `--seed-from-features-dir` để reuse feature baseline nếu metadata encoder khớp.
+
+Experiment servo cũ đã triển khai riêng, không làm bẩn baseline:
+
+```text
+tool build: src/tools/build_servo_experiment_dataset.py
+mixed root: data/experiments/servo_old_mix_v1
+old-only root: data/experiments/servo_old_only_v1
+mixed hydra: configs/hydra/experiment/rc_jepa_tiny_mix_oldservo_frame_stride2.yaml
+old-only hydra: configs/hydra/experiment/rc_jepa_tiny_oldservo_frame_stride2.yaml
+```
+
+Audit experiment servo cũ:
+
+```text
+mixed:
+  sessions: current_servo 100 + old_servo 28
+  samples train/val/test: 114579 / 49226 / 49226 alias val
+  frame_stride=2 windows train/val/test: 79765 / 34926 / 34926 alias val
+  domain windows train: current_servo 54216, old_servo 25549
+
+old-only:
+  sessions: old_servo 28
+  samples train/val/test: 36564 / 12695 / 12695 alias val
+  frame_stride=2 windows train/val/test: 25549 / 8865 / 8865 alias val
+```
+
+Chưa chạy feature extraction/train thật cho experiment servo cũ vì GPU driver đang lỗi:
+
+```text
+nvidia-smi fail
+torch.cuda.is_available() = False
+```
 
 Các default quan trọng hiện tại:
 
@@ -221,7 +255,7 @@ Kiểm tra gần nhất:
 
 ```text
 compileall: pass
-unit tests: 41/41 pass
+unit tests: 47/47 pass
 Hydra official_lite dry-run: pass
 official_lite full-token smoke loss: pass
 web smoke test: /, /app.js, /styles.css, /api/sessions, /api/jobs đều HTTP 200
@@ -303,7 +337,15 @@ Mỗi dòng trong manifest là một frame sample:
 }
 ```
 
-Manifest được split theo `session_id`, không split ngẫu nhiên từng frame, để tránh leakage giữa train/val/test.
+Manifest được split theo `session_id`, không split ngẫu nhiên từng frame, để tránh leakage giữa train/val. Hiện không có test split độc lập; `test.jsonl` là alias của `val.jsonl`.
+
+Tool chuyển manifest cũ sang chế độ này:
+
+```text
+src/tools/drop_test_split.py
+```
+
+Tool đã được sửa idempotent: nếu `test.jsonl` đã là alias của `val.jsonl`, chạy lại sẽ không nhập trùng sample vào val.
 
 ## State và action ban đầu
 
@@ -686,8 +728,8 @@ Preprocess hiện tại đã rebuild manifest với outlier robust:
 
 ```text
 train: 84766 samples, 68139 windows
-val:   9470 samples, 8259 windows
-test:  20310 samples, 16138 windows
+val:   29780 samples, 24397 windows
+test:  29780 samples, 24397 windows  # alias của val
 ```
 
 Report mới:
@@ -711,10 +753,11 @@ Metrics:
 ```text
 train/*
 val/*
-test/*
 best/val_loss
 lr
 ```
+
+`test/*` chỉ xuất hiện nếu chạy eval/test riêng hoặc bật `--run-test`; train feature-cache mặc định bỏ test và chỉ dùng val.
 
 Tắt W&B:
 
@@ -742,13 +785,15 @@ Log offline:
 ## Việc nên làm tiếp
 
 1. Sửa GPU/driver trước, vì `nvidia-smi` đang fail.
-2. Chạy extract bù feature cache ViT-B fp32; hiện manifest có 100 session nhưng cache thiếu 37 `.json`.
+2. Baseline feature cache ViT-B fp32 hiện đủ 100 session; chỉ extract lại nếu Drive có session mới hoặc đổi feature preset.
 3. Nếu Drive có data mới: mở web, bấm `Sync Drive` và theo dõi progress/log.
 4. Kiểm tra session mới trong web viewer.
 5. Bấm `Preprocess` để rebuild manifest và theo dõi progress theo session.
 6. Chọn `Feature model`, rồi bấm `Extract V-JEPA Features`; cache cũ đúng thì sẽ skip, session mới thì mới extract.
-7. Train thử predictor `simple tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type simple --model-size tiny`.
-8. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
-9. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
-10. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
-11. Sau khi loss ổn, thêm planner/MPC hoặc policy head để chọn action.
+7. Với experiment servo cũ: chạy extract feature cho `servo_old_mix_v1` hoặc `servo_old_only_v1` sau khi GPU hoạt động.
+8. Train thử `simple tiny` mixed servo bằng Hydra: `experiment=rc_jepa_tiny_mix_oldservo_frame_stride2`.
+9. Train thử `simple tiny` old-only bằng Hydra: `experiment=rc_jepa_tiny_oldservo_frame_stride2`.
+10. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
+11. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
+12. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
+13. Sau khi loss ổn, thêm planner/MPC hoặc policy head để chọn action.

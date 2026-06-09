@@ -1,14 +1,14 @@
 # @package _global_
 
-output_dir: checkpoints/rc_jepa_ac_vitb_features_newdata_tiny
+output_dir: checkpoints/rc_jepa_ac_vitb_features_oldservo_tiny_frame_stride2
 
 runtime:
   dry_run: false
   require_cuda: true
 
 data:
-  features_dir: data/processed/features/vjepa2_1_vitb_384_ema_fp32
-  manifest_dir: data/processed/manifests
+  features_dir: data/experiments/servo_old_only_v1/features/vjepa2_1_vitb_384_ema_fp32
+  manifest_dir: data/experiments/servo_old_only_v1/processed/manifests
   state_columns:
     - yaw_rate_t
     - accel_x_t
@@ -20,7 +20,7 @@ data:
     - throttle_cmd_t
   raw_frames_per_sample: 8
   sequence_stride: 1
-  frame_stride: 1
+  frame_stride: 2
   target_fps: 0.0
   auto_steps: 2
 
@@ -54,7 +54,7 @@ wandb:
   disabled: false
   project: nn-jepa-rc
   entity: null
-  run_name: rc-jepa-tiny-newdata
+  run_name: rc-jepa-tiny-oldservo-frame-stride2
   run_id: null
   continue_run: true
   resume: allow
@@ -62,8 +62,8 @@ wandb:
   tags:
     - tiny
     - hydra
-    - new-data
-    - simple
+    - old-servo
+    - frame-stride2
   log_every: 20
   watch_log: gradients
   watch_freq: 200

@@ -42,25 +42,36 @@ def preprocess_all_sessions(progress_callback: ProgressCallback | None = None) -
     if not session_samples:
         raise RuntimeError("No usable sample found after preprocessing")
 
-    split_map = build_session_split(list(session_samples.keys()))
+    split_map = build_session_split(list(session_samples.keys()), include_test=settings.USE_TEST_SPLIT)
     manifest_counts: dict[str, int] = {"train": 0, "val": 0, "test": 0}
     manifest_sessions: dict[str, list[str]] = {"train": [], "val": [], "test": []}
+    split_samples: dict[str, list[dict[str, Any]]] = {"train": [], "val": [], "test": []}
 
-    for split_name in ("train", "val", "test"):
-        manifest_path = settings.MANIFEST_DIR / f"{split_name}.jsonl"
-        with manifest_path.open("w", encoding="utf-8") as handle:
-            for session_id, samples in session_samples.items():
-                if split_map[session_id] != split_name:
-                    continue
-                manifest_sessions[split_name].append(session_id)
-                for sample in samples:
-                    sample["split"] = split_name
-                    handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
-                    manifest_counts[split_name] += 1
+    for session_id, samples in session_samples.items():
+        split_name = split_map[session_id]
+        manifest_sessions[split_name].append(session_id)
+        for sample in samples:
+            next_sample = dict(sample)
+            next_sample["split"] = split_name
+            split_samples[split_name].append(next_sample)
+
+    test_is_val_alias = not settings.USE_TEST_SPLIT and settings.ALIAS_TEST_TO_VAL
+    if test_is_val_alias:
+        manifest_sessions["test"] = list(manifest_sessions["val"])
+        split_samples["test"] = [
+            {**sample, "split": "test"}
+            for sample in split_samples["val"]
+        ]
+
+    for split_name, samples in split_samples.items():
+        write_jsonl(settings.MANIFEST_DIR / f"{split_name}.jsonl", samples)
+        manifest_counts[split_name] = len(samples)
 
     summary = {
         "raw_data_dir": str(settings.RAW_DATA_DIR),
         "processed_data_dir": str(settings.PROCESSED_DATA_DIR),
+        "use_test_split": settings.USE_TEST_SPLIT,
+        "test_is_val_alias": test_is_val_alias,
         "counts": manifest_counts,
         "preferred_training_files": {
             "actions": settings.SYNCED_ACTIONS_CSV_NAME,
@@ -82,6 +93,12 @@ def preprocess_all_sessions(progress_callback: ProgressCallback | None = None) -
     report_path = settings.REPORT_DIR / "preprocess_report.json"
     report_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def write_jsonl(path: Path, samples: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for sample in samples:
+            handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
 
 
 def find_session_dirs() -> list[Path]:
@@ -539,13 +556,21 @@ def median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
-def build_session_split(session_ids: list[str]) -> dict[str, str]:
+def build_session_split(session_ids: list[str], include_test: bool | None = None) -> dict[str, str]:
     import random
 
+    include_test = settings.USE_TEST_SPLIT if include_test is None else include_test
     shuffled = session_ids[:]
     random.Random(settings.RANDOM_SEED).shuffle(shuffled)
     total = len(shuffled)
-    if total == 1:
+    if not include_test:
+        if total == 1:
+            counts = {"train": 1, "val": 0, "test": 0}
+        else:
+            train_count = max(1, int(total * settings.TRAIN_RATIO))
+            train_count = min(train_count, total - 1)
+            counts = {"train": train_count, "val": total - train_count, "test": 0}
+    elif total == 1:
         counts = {"train": 1, "val": 0, "test": 0}
     elif total == 2:
         counts = {"train": 1, "val": 0, "test": 1}

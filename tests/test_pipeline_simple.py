@@ -45,6 +45,13 @@ class SimplePipelineTests(unittest.TestCase):
         self.assertEqual(len(values), 3)
         self.assertIn("train", values)
         self.assertIn("val", values)
+        self.assertNotIn("test", values)
+
+    def test_build_session_split_can_still_make_explicit_test_split(self) -> None:
+        split_map = build_session_split(["s1", "s2", "s3"], include_test=True)
+        values = list(split_map.values())
+        self.assertIn("train", values)
+        self.assertIn("val", values)
         self.assertIn("test", values)
 
     def test_actions_csv_can_be_mapped_to_model_action_and_state(self) -> None:

@@ -97,9 +97,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--no-progress", action="store_true")
+    test_group = parser.add_mutually_exclusive_group()
+    test_group.add_argument(
+        "--skip-test",
+        dest="skip_test",
+        action="store_true",
+        default=True,
+        help="Skip final test evaluation after training. Validation still runs every epoch.",
+    )
+    test_group.add_argument(
+        "--run-test",
+        dest="skip_test",
+        action="store_false",
+        help="Run final test evaluation from best.pt after training.",
+    )
     add_wandb_args(parser)
-    args = parser.parse_args(argv)
-    args._output_dir_was_provided = "--output-dir" in argv or any(arg.startswith("--output-dir=") for arg in argv)
+    argv_list = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(argv_list)
+    args._output_dir_was_provided = "--output-dir" in argv_list or any(
+        arg.startswith("--output-dir=") for arg in argv_list
+    )
     return args
 
 
@@ -161,6 +178,8 @@ def run_epoch(
         "teacher_forcing_loss": 0.0,
         "rollout_loss": 0.0,
     }
+    domain_totals: dict[str, dict[str, float]] = {}
+    domain_counts: dict[str, int] = {}
     total_samples = 0
     global_step = global_step_start
     progress = tqdm(dataloader, desc=label, leave=False, disable=not show_progress)
@@ -201,6 +220,39 @@ def run_epoch(
                 action_columns=action_columns,
             )
             loss = outputs["loss"]
+            if not training and "data_domain" in batch:
+                domains = [str(value) for value in batch["data_domain"]]
+                for domain in sorted(set(domains)):
+                    row_indices = [row for row, value in enumerate(domains) if value == domain]
+                    if not row_indices:
+                        continue
+                    if len(row_indices) == latents.size(0):
+                        domain_outputs = outputs
+                    else:
+                        index_tensor = torch.tensor(row_indices, dtype=torch.long, device=device)
+                        domain_outputs = compute_world_model_losses(
+                            predictor=predictor,
+                            latents=latents.index_select(0, index_tensor),
+                            states=states.index_select(0, index_tensor),
+                            actions=actions.index_select(0, index_tensor),
+                            tokens_per_frame=tokens_per_frame,
+                            auto_steps=auto_steps,
+                            state_columns=state_columns,
+                            action_columns=action_columns,
+                        )
+                    domain_totals.setdefault(
+                        domain,
+                        {
+                            "loss": 0.0,
+                            "teacher_forcing_loss": 0.0,
+                            "rollout_loss": 0.0,
+                        },
+                    )
+                    domain_counts[domain] = domain_counts.get(domain, 0) + len(row_indices)
+                    for key in totals:
+                        domain_totals[domain][key] += (
+                            float(domain_outputs[key].detach().item()) * len(row_indices)
+                        )
             if training:
                 loss.backward()
                 if should_log_grad_stats:
@@ -233,7 +285,12 @@ def run_epoch(
                 batch_metrics.update(extra_batch_metrics)
                 log_metrics(wandb_run, flatten_metrics(wandb_prefix, batch_metrics), step=global_step)
 
-    return average_metrics(totals, total_samples), global_step
+    metrics = average_metrics(totals, total_samples)
+    for domain, totals_by_key in domain_totals.items():
+        domain_metrics = average_metrics(totals_by_key, domain_counts.get(domain, 0))
+        for key, value in domain_metrics.items():
+            metrics[f"domain/{domain}/{key}"] = value
+    return metrics, global_step
 
 
 def average_metrics(totals: dict[str, float], total_samples: int) -> dict[str, float]:
@@ -416,6 +473,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         target_fps=args.target_fps,
         state_columns=args.state_columns,
         action_columns=args.action_columns,
+        include_test=not args.skip_test,
     )
     train_dataset = dataloaders["train"].dataset
     tokens_per_frame = int(train_dataset.tokens_per_frame)
@@ -437,7 +495,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         "device": str(device),
         "train_sequences": len(dataloaders["train"].dataset),
         "val_sequences": len(dataloaders["val"].dataset),
-        "test_sequences": len(dataloaders["test"].dataset),
+        "test_sequences": 0 if args.skip_test else len(dataloaders["test"].dataset),
+        "skip_test": bool(args.skip_test),
         "trainable_parameters": count_trainable_parameters(predictor),
         "tokens_per_frame": tokens_per_frame,
         "embed_dim": embed_dim,
@@ -651,6 +710,20 @@ def main(args: argparse.Namespace | None = None) -> None:
                 )
                 break
 
+        result = {
+            "best_val_loss": best_val_loss,
+            "best_epoch": best_epoch,
+            "final_epoch": final_epoch,
+            "resume_from": None if resumed_from is None else str(resumed_from),
+            "test_skipped": bool(args.skip_test),
+        }
+        if args.skip_test:
+            write_json(args.output_dir / "final_metrics.json", result)
+            log_metrics(wandb_run, {"best/val_loss": best_val_loss}, step=max(global_step, 1))
+            update_summary(wandb_run, {"best/val_loss": best_val_loss})
+            print(json.dumps(result, indent=2), flush=True)
+            return
+
         best_checkpoint = torch.load(args.output_dir / "best.pt", map_location=device)
         predictor.load_state_dict(best_checkpoint["predictor_state_dict"])
         optimizer.zero_grad(set_to_none=True)
@@ -671,12 +744,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 show_progress=not args.no_progress,
             )
 
-        result = {
-            "best_val_loss": best_val_loss,
-            "best_epoch": best_epoch,
-            "resume_from": None if resumed_from is None else str(resumed_from),
-            "test": test_metrics,
-        }
+        result["test"] = test_metrics
         write_json(args.output_dir / "test_metrics.json", result)
         log_metrics(
             wandb_run,

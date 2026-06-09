@@ -60,6 +60,7 @@ def build_train_args(cfg: Any) -> Namespace:
     device_value = str(train_cfg.get("device", args.device))
     args.device = train_cli.default_device() if device_value == "auto" else device_value
     args.no_progress = bool(train_cfg.get("no_progress", args.no_progress))
+    args.skip_test = bool(train_cfg.get("skip_test", args.skip_test))
 
     output_dir = data.get("output_dir", args.output_dir)
     args.output_dir = path_value(output_dir)

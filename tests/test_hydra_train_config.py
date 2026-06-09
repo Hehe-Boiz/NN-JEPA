@@ -44,6 +44,7 @@ class HydraTrainConfigTests(unittest.TestCase):
                     "seed": 123,
                     "device": "cpu",
                     "no_progress": True,
+                    "skip_test": False,
                 },
                 "wandb": {
                     "disabled": True,
@@ -72,6 +73,7 @@ class HydraTrainConfigTests(unittest.TestCase):
         self.assertEqual(args.state_columns, ["yaw_rate_t", "accel_x_t"])
         self.assertEqual(args.batch_size, 4)
         self.assertEqual(args.device, "cpu")
+        self.assertFalse(args.skip_test)
         self.assertTrue(args.no_wandb)
         self.assertFalse(args.wandb_continue_run)
         self.assertEqual(args.wandb_tags, ["tiny", "test"])
