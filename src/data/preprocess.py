@@ -13,6 +13,7 @@ from typing import Any, Callable
 from PIL import Image
 
 from . import settings
+from .sync import sync_session
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -108,6 +109,7 @@ def find_session_dirs() -> list[Path]:
 
 
 def preprocess_one_session(session_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    sync_report = maybe_sync_session(session_dir)
     csv_path = find_actions_csv_file(session_dir)
     frame_map = build_frame_map(session_dir / settings.FRAME_DIR_NAME)
     aux_streams = load_aux_streams(session_dir)
@@ -131,6 +133,7 @@ def preprocess_one_session(session_dir: Path) -> tuple[list[dict[str, Any]], dic
         "matched_accel_rows": 0,
         "matched_gyro_rows": 0,
         "matched_gps_rows": 0,
+        "sync": sync_report,
     }
     report.update(synced_imu_report)
 
@@ -229,6 +232,18 @@ def preprocess_one_session(session_dir: Path) -> tuple[list[dict[str, Any]], dic
     if len(session_samples) < settings.MIN_SESSION_SAMPLES:
         return [], report
     return session_samples, report
+
+
+def maybe_sync_session(session_dir: Path) -> dict[str, Any]:
+    if not settings.SYNC_BEFORE_PREPROCESS:
+        return {"enabled": False, "status": "disabled"}
+    return sync_session(
+        session_dir,
+        camera_delay_ms=settings.SYNC_CAMERA_DELAY_MS,
+        telemetry_gap_tol_ms=settings.SYNC_TELEMETRY_GAP_TOL_MS,
+        keep_all_modes=settings.SYNC_KEEP_ALL_MODES,
+        write_imu=settings.SYNC_WRITE_IMU,
+    )
 
 
 def find_actions_csv_file(session_dir: Path) -> Path:

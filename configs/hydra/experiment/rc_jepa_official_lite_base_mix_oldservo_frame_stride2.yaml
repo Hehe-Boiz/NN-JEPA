@@ -1,6 +1,12 @@
 # @package _global_
 
-output_dir: checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_official_lite_tiny_frame_stride2
+# Strongest current official-lite predictor for mixed current-servo + old-servo data.
+# This keeps the same temporal/data setup as the tiny mixed experiment, but uses
+# model.size=base: predictor_dim=512, depth=6, heads=8 (~19.7M trainable params).
+# With 8 frames/sample and 576 tokens/frame, this is heavy on 16GB VRAM, so the
+# default batch is intentionally conservative.
+
+output_dir: checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_official_lite_base_frame_stride2
 
 runtime:
   dry_run: false
@@ -26,7 +32,7 @@ data:
 
 model:
   type: official_lite
-  size: tiny
+  size: base
   predictor_dim: null
   predictor_depth: null
   predictor_heads: null
@@ -34,12 +40,12 @@ model:
 
 train:
   epochs: 100
-  batch_size: 32
-  eval_batch_size: 2
-  num_workers: 6
+  batch_size: 2
+  eval_batch_size: 1
+  num_workers: 4
   train_sampler: session
   eval_sampler: session
-  lr: 1.0e-4
+  lr: 5.0e-5
   weight_decay: 1.0e-4
   grad_clip: 1.0
   warmup_epochs: 5
@@ -50,10 +56,10 @@ train:
   val_rollout_eval_horizon: 3
   val_rollout_eval_max_batches: 256
   final_eval_horizon: 3
-  final_planning_eval_samples: 32
+  final_planning_eval_samples: 16
   final_planning_horizon: 0
   final_planning_goal_offset: 0
-  final_planning_cem_samples: 64
+  final_planning_cem_samples: 32
   final_planning_cem_elites: 8
   final_planning_cem_iters: 3
   final_planning_init_std: 0.5
@@ -70,18 +76,19 @@ wandb:
   disabled: false
   project: nn-jepa-rc
   entity: null
-  run_name: rc-jepa-official-lite-tiny-mix-oldservo-frame-stride2
+  run_name: rc-jepa-official-lite-base-mix-oldservo-frame-stride2
   run_id: null
   continue_run: true
   resume: allow
   mode: online
   tags:
     - official_lite
-    - tiny
+    - base
     - hydra
     - mixed-servo
     - old-servo
     - frame-stride2
+    - strongest
   log_every: 20
   watch_log: gradients
   watch_freq: 200

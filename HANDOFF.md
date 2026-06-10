@@ -15,6 +15,7 @@ doc/bao_cao_oom_eval_val_vs_train_batch.md
 doc/bao_cao_jepa_update_20260609_inference.md
 doc/ke_hoach_inference_an_toan_nn_jepa.md
 doc/bao_cao_trien_khai_experiment_servo_cu.md
+doc/bao_cao_metric_danh_gia_val_rollout_identity.md
 ```
 
 Kết quả audit mới nhất:
@@ -29,10 +30,14 @@ smoke planning plot SVG: pass trên /tmp/nn_jepa_plan_smoke/planning_test.jsonl
 Hydra dry-run rc_jepa_tiny_newdata: pass
 Hydra wandb.continue_run=true/false: pass
 feature cache ViT-B fp32: đã xóa để giải phóng disk
-feature cache ViT-B fp16: chưa extract lại
+feature cache baseline ViT-B fp16: chưa extract lại
+feature cache servo_old_mix_v1 ViT-B fp16: đã extract xong, 211 session, 212840 frame
 official_lite predictor trước đó: pass shape/mask/RoPE/loss smoke
 action-block causal mask: khớp source vjepa2 cho case thật [4624, 4624]
 RoPE rotation: khớp source vjepa2, max diff = 0.0
+per-epoch val rollout-vs-identity metrics: đã thêm, py_compile pass, Hydra dry-run base mixed pass
+final planning eval: đã thêm `final_planning_val/*` optional cuối train trên best.pt
+feature train sampler: giữ `global` mặc định, official-lite mixed dùng `train_sampler=session`, `eval_sampler=session`
 git diff --check: pass
 ```
 
@@ -42,7 +47,7 @@ Blocker môi trường hiện tại trước khi train thật:
 GPU/CUDA: nvidia-smi fail, chưa giao tiếp được NVIDIA driver
 ```
 
-Việc cần làm ngay trước train: sửa GPU/driver rồi extract lại feature fp16.
+Việc cần làm ngay trước train baseline: sửa GPU/driver rồi extract lại feature fp16. Riêng `servo_old_mix_v1` đã có feature cache fp16 hợp lệ và có thể train ngay bằng config mixed.
 
 `JEPA/` vừa kiểm tra sau khi pull:
 
@@ -68,6 +73,8 @@ test:  57829 samples, 48103 windows  # alias của val
 feature cache path: data/processed/features/vjepa2_1_vitb_384_ema_fp16
 feature cache status: chưa extract lại sau khi xóa fp32
 expected metadata: 161037 frame, 576 token/frame, embed_dim 768, fp16
+mixed feature cache path: data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16
+mixed feature cache status: đã extract xong, 211 session, 212840 frame, 576 token/frame, embed_dim 768, fp16, source_frame_path
 ```
 
 Ghi chú inference sau khi đọc JEPA mới:
@@ -113,9 +120,9 @@ JEPA/data/drive_zips:
   2 zip cũ trong trong nhà/ staging-only, không train
 
 JEPA/data/drive_extra_nonzip/data servo cũ KDS 680HV:
-  28 session cũ 20260605
-  53403 file
-  actions_synced.csv / imu_synced.csv đủ 28/28
+  30 session cũ 20260605
+  56027 file
+  actions_synced.csv / imu_synced.csv đủ 30/30
   không đưa vào data/raw baseline
 ```
 
@@ -201,11 +208,14 @@ Audit experiment servo cũ:
 mixed meaning: current_servo trong data/raw + old_servo ngoài JEPA/data/drive_extra_nonzip
 mixed split file: data/split_vjepa_ac_car.json
 mixed sessions: 181 current_servo + 30 old_servo = 211
-mixed samples train/val/test: 182562 / 30282 / 30282 alias val
-mixed frame_stride=2 windows train/val/test: 128617 / 20501 / 20501 alias val
+mixed samples train/val/test: 182558 / 30282 / 30282 alias val
+mixed frame_stride=2 windows train/val/test: 128566 / 20501 / 20501 alias val
+mixed feature cache fp16: đã extract lại sạch từ raw frame gốc, 211 session, 212840 frame, dtype fp16, image_path_key=source_frame_path
+mixed DataLoader frame_stride=2 windows: train 128566, val 20501
+mixed sample shape: latents (4608,768), states (8,5), actions (7,2)
 old-only: đã xóa, không còn Hydra config riêng
 preprocess_report bad_sessions: 0
-feature extraction/train thật cho experiment servo cũ: chưa chạy vì GPU driver lỗi
+feature extraction mixed hiện tại đã chạy lại bằng extractor mới; train guard metadata pass vì cache có image_path_key=source_frame_path
 ```
 
 Default quan trọng:
@@ -610,12 +620,15 @@ Tắt bằng:
 4. Kiểm tra session mới trong viewer.
 5. Bấm `Preprocess` để rebuild manifest, theo dõi progress theo session.
 6. Chọn `Feature model`, rồi bấm `Extract V-JEPA Features`; cache đúng thì skip, session mới thì extract.
-7. Với experiment servo cũ: chỉ còn `servo_old_mix_v1`; chạy extract feature sau khi GPU hoạt động.
+7. Với experiment servo cũ: `servo_old_mix_v1` đã có feature cache fp16 hợp lệ, có thể train.
 8. Train thử `simple tiny` mixed servo bằng Hydra: `experiment=rc_jepa_tiny_mix_oldservo_frame_stride2`.
-9. Train thử predictor `official_lite tiny` bằng `tools.train_rc_jepa_ac_features --predictor-type official_lite --model-size tiny --batch-size 4 --eval-batch-size 1`.
-10. Khi pipeline/loss/log ổn, so sánh `simple base` với `official_lite small/base`.
-11. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
-12. Sau khi world model loss ổn, thêm planner/MPC hoặc policy head để chọn action.
+9. Train `official_lite base` mixed servo mạnh nhất hiện tại bằng Hydra: `experiment=rc_jepa_official_lite_base_mix_oldservo_frame_stride2`.
+10. Official-lite mixed dùng session sampler: 1 batch cùng session, shuffle session/window trong train, drain session rồi sang session kế tiếp.
+11. Nếu base OOM/chậm quá, quay về `official_lite tiny`: `experiment=rc_jepa_official_lite_tiny_mix_oldservo_frame_stride2`.
+12. Theo dõi `val/rollout_l1_h*`, `val/identity_l1_h*`, `val/ratio_h*`; `ratio_h* < 1` nghĩa là model tốt hơn identity baseline.
+13. Cuối train official-lite mixed sẽ có `final_planning_val/*`; `planned_zero_ratio < 1` nghĩa là CEM planner tốt hơn zero-action baseline theo world model.
+14. Eval/test bằng `tools.eval_rc_jepa_ac_features`.
+15. Sau khi world model loss ổn, chạy planning offline riêng với nhiều sample hơn hoặc thêm planner/MPC/policy head.
 
 ## Ràng buộc cần nhớ
 

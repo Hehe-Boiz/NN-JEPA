@@ -45,7 +45,7 @@ feature cache ViT-B fp32: đã xóa để giải phóng disk
 feature cache ViT-B fp16: cần extract lại vào data/processed/features/vjepa2_1_vitb_384_ema_fp16
 ```
 
-Vì vậy trước khi train thật cần sửa GPU/driver để `nvidia-smi` và `torch.cuda.is_available()` hoạt động, rồi extract lại feature fp16.
+Vì vậy trước khi train baseline thật cần sửa GPU/driver để `nvidia-smi` và `torch.cuda.is_available()` hoạt động, rồi extract lại feature fp16. Riêng experiment `servo_old_mix_v1` đã có feature cache fp16 hợp lệ và có thể train bằng Hydra config mixed.
 
 Inference offline kiểu JEPA đã có:
 
@@ -940,6 +940,7 @@ Lưu ý khi dùng feature cache:
 - bước extract vẫn cần checkpoint encoder V-JEPA 2.1
 - bước train từ feature không load encoder nữa, chỉ train predictor
 - `tools.train_rc_jepa_ac_features` đọc `latents` từ `.npy`, không gọi `FrozenVJepa21Encoder`
+- feature cache hợp lệ hiện phải có metadata `image_path_key: source_frame_path`; cache cũ thiếu field này sẽ bị DataLoader train chặn để tránh dùng nhầm feature từ ảnh processed 224px
 - `tools.extract_vjepa_features` skip session đã có `.npy + .json` đúng shape/dtype, không extract lại
 - nếu toàn bộ cache đã đầy đủ và metadata khớp, extractor kết thúc sớm mà không load encoder/checkpoint
 - trước `val` và `test`, script gọi `torch.cuda.empty_cache()` để giảm bớt rủi ro OOM do bộ nhớ đệm cũ
@@ -1013,23 +1014,23 @@ Trạng thái hiện tại trên disk:
 - baseline `data/raw` có `181` session current.
 - `servo_old_mix_v1` đã rebuild theo split JSON: `181 current_servo + 30 old_servo = 211` session.
 - `servo_old_only_v1` đã bị xóa và config old-only cũng đã bỏ.
+- feature cache mixed đã extract lại sạch từ raw frame gốc: `211` session, `212,840` frame, `fp16`, `image_path_key=source_frame_path`.
 
-Sau khi GPU hoạt động, extract feature cho mixed experiment:
+Lệnh extract feature mixed nếu cần chạy lại:
 
 ```bash
 PYTHONPATH=src python3 -m tools.extract_vjepa_features \
   --vjepa-root vjepa2 \
   --encoder-preset vitb_384 \
   --manifest-dir data/experiments/servo_old_mix_v1/processed/manifests \
-  --splits train val \
   --output-dir data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16 \
-  --seed-from-features-dir data/processed/features/vjepa2_1_vitb_384_ema_fp16 \
-  --batch-size 32 \
+  --batch-size 256 \
+  --num-workers 8 \
   --dtype fp16 \
   --splits train val
 ```
 
-`--seed-from-features-dir` sẽ reuse feature baseline fp16 nếu metadata encoder khớp, rồi chỉ encode thêm phần old-servo chưa có cache.
+Extractor sẽ skip session đã đủ `.npy + .json` đúng metadata. Không cần `--overwrite` khi chỉ resume sau lỗi giữa chừng.
 
 Train mixed tiny:
 
@@ -1040,10 +1041,77 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
 
 Config mixed đang dùng `simple tiny`, `raw_frames_per_sample=8`, `frame_stride=2`, `batch_size=32`, `eval_batch_size=2`. Nên train fresh, không resume checkpoint cũ, vì data distribution và split đã đổi.
 
+Train mixed `official_lite base` mạnh nhất hiện tại:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_official_lite_base_mix_oldservo_frame_stride2
+```
+
+Config này dùng `official_lite base`: `predictor_dim=512`, `depth=6`, `heads=8`, khoảng `19,707,648` tham số trainable. Vì mỗi sample có `8 x 576 = 4608` token, default đặt `batch_size=2`, `eval_batch_size=1`, `amp_dtype=bf16` để an toàn hơn trên GPU 16GB.
+
+Sampler của config official-lite mixed:
+
+```text
+train.train_sampler = session
+train.eval_sampler = session
+```
+
+Ý nghĩa:
+
+```text
+1 batch chỉ chứa window từ 1 session.
+Train shuffle thứ tự session mỗi epoch.
+Train shuffle window bên trong từng session mỗi epoch.
+Nhiều batch liền kề sẽ cùng session cho tới khi session đó hết window.
+Thứ tự frame bên trong từng window vẫn giữ đúng causal order, ví dụ [505,507,...,519].
+```
+
+Muốn quay lại cách cũ:
+
+```bash
+train.train_sampler=global train.eval_sampler=global
+```
+
+Metric val rollout-vs-identity đã bật trong config official-lite mixed:
+
+```text
+train.val_rollout_eval_horizon = 3
+train.val_rollout_eval_max_batches = 256
+```
+
+Mỗi epoch sẽ log/in thêm:
+
+```text
+val/rollout_l1_h1, val/identity_l1_h1, val/ratio_h1
+val/rollout_l1_h2, val/identity_l1_h2, val/ratio_h2
+val/rollout_l1_h3, val/identity_l1_h3, val/ratio_h3
+```
+
+Cuối train còn chạy final planning eval nhỏ trên `best.pt`:
+
+```text
+base mixed: final_planning_eval_samples = 16, CEM 32 samples x 3 iters
+tiny mixed: final_planning_eval_samples = 32, CEM 64 samples x 3 iters
+```
+
+Metric chính:
+
+```text
+final_planning_val/mean_planned_final_l1
+final_planning_val/mean_groundtruth_final_l1
+final_planning_val/mean_zero_action_final_l1
+final_planning_val/planned_zero_ratio
+final_planning_val/planned_groundtruth_ratio
+final_planning_val/mean_first_action_mae
+```
+
 Báo cáo chi tiết:
 
 ```text
 doc/bao_cao_trien_khai_experiment_servo_cu.md
+doc/bao_cao_metric_danh_gia_val_rollout_identity.md
 ```
 
 ## State và action hiện tại
@@ -1123,10 +1191,12 @@ train/val split độc lập theo session; test split không độc lập vì te
 feature cache baseline fp32: đã xóa
 feature cache baseline fp16: chưa extract lại
 servo_old_mix_v1: 211 session selected = 181 current + 30 old
-servo_old_mix_v1 samples train/val/test: 182,562 / 30,282 / 30,282 alias val
+servo_old_mix_v1 synced CSV coverage: 211/211 dùng actions_synced.csv + imu_synced.csv
+servo_old_mix_v1 feature cache fp16: đã extract lại sạch, 211 session, 212,840 frame, dtype fp16, image_path_key source_frame_path
+servo_old_mix_v1 samples train/val/test: 182,558 / 30,282 / 30,282 alias val
 servo_old_only_v1: đã xóa
 servo_old frame_stride=2 windows:
-  mixed train/val/test = 128,617 / 20,501 / 20,501 alias val
+  mixed train/val/test = 128,566 / 20,501 / 20,501 alias val
 web smoke test: /, /app.js, /styles.css, /api/sessions, /api/jobs đều HTTP 200
 unit tests: 47/47 pass
 ```
@@ -1144,9 +1214,9 @@ Data servo cũ:
   `data servo cũ KDS 680HV-20260608T112340Z-3-001.zip`,
   `data servo cũ KDS 680HV-20260608T112340Z-3-002.zip`,
   `data servo cũ KDS 680HV-20260608T112340Z-3-003.zip`.
-- Sau giải nén có `28` session, `53,403` file.
-- Session `session_20260605_155710` từng thiếu synced; đã chạy lại `jepa_wm.data.sync`, giữ `47` frame, bỏ `1`, `offset=100ms +imu`.
-- Hiện `actions_synced.csv` và `imu_synced.csv` đủ `28/28`.
+- Sau giải nén/sync bổ sung có `30` session, `56,027` file.
+- Các session từng thiếu synced đã được chạy lại `jepa_wm.data.sync`: `session_20260605_155710`, `session_20260605_225028`, `session_20260605_225326`.
+- Hiện `actions_synced.csv` và `imu_synced.csv` đủ `30/30`.
 
 Lệnh kiểm tra zip với Drive:
 
@@ -1299,6 +1369,24 @@ Với `tools.train_rc_jepa_ac_features`, mặc định chỉ có `train/*`, `tra
 
 Ngoài metric theo epoch, loop train còn log thêm `train_batch/*` theo batch để nhìn thấy loss curve ngay trong lúc epoch đang chạy.
 
+Với config official-lite mixed, `val_rollout_eval_horizon=3` nên sau mỗi epoch có thêm metric rollout-vs-identity trên val:
+
+```text
+val/rollout_l1_h1
+val/identity_l1_h1
+val/ratio_h1
+val/rollout_l1_h2
+val/identity_l1_h2
+val/ratio_h2
+val/rollout_l1_h3
+val/identity_l1_h3
+val/ratio_h3
+```
+
+`ratio_h* < 1.0` nghĩa là rollout của model tốt hơn baseline giữ nguyên latent hiện tại ở horizon đó. Chi tiết xem `doc/bao_cao_metric_danh_gia_val_rollout_identity.md`.
+
+Cuối train, nếu `final_planning_eval_samples > 0`, script cũng log `final_planning_val/*`. Đây là offline CEM planning eval trên val, không chạy xe thật. `planned_zero_ratio < 1.0` nghĩa là planner tìm action tốt hơn zero-action baseline theo world model.
+
 Trục step trên W&B:
 
 - `train_batch/*` log theo `global_step`.
@@ -1369,6 +1457,9 @@ train/rollout_loss
 val/loss
 val/teacher_forcing_loss
 val/rollout_loss
+val/rollout_l1_h1
+val/identity_l1_h1
+val/ratio_h1
 test/loss
 test/teacher_forcing_loss
 test/rollout_loss

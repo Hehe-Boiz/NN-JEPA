@@ -48,6 +48,8 @@ def build_train_args(cfg: Any) -> Namespace:
     args.batch_size = int(train_cfg.get("batch_size", args.batch_size))
     args.eval_batch_size = int(train_cfg.get("eval_batch_size", args.eval_batch_size))
     args.num_workers = int(train_cfg.get("num_workers", args.num_workers))
+    args.train_sampler = str(train_cfg.get("train_sampler", args.train_sampler))
+    args.eval_sampler = str(train_cfg.get("eval_sampler", args.eval_sampler))
     args.lr = float(train_cfg.get("lr", args.lr))
     args.weight_decay = float(train_cfg.get("weight_decay", args.weight_decay))
     args.grad_clip = float(train_cfg.get("grad_clip", args.grad_clip))
@@ -55,6 +57,44 @@ def build_train_args(cfg: Any) -> Namespace:
     args.warmup_start_factor = float(train_cfg.get("warmup_start_factor", args.warmup_start_factor))
     args.min_lr_ratio = float(train_cfg.get("min_lr_ratio", args.min_lr_ratio))
     args.early_stopping_patience = int(train_cfg.get("early_stopping_patience", args.early_stopping_patience))
+    args.amp_dtype = str(train_cfg.get("amp_dtype", args.amp_dtype))
+    args.final_eval_horizon = int(train_cfg.get("final_eval_horizon", args.final_eval_horizon))
+    args.val_rollout_eval_horizon = int(
+        train_cfg.get("val_rollout_eval_horizon", args.val_rollout_eval_horizon)
+    )
+    args.val_rollout_eval_max_batches = int(
+        train_cfg.get("val_rollout_eval_max_batches", args.val_rollout_eval_max_batches)
+    )
+    args.final_planning_eval_samples = int(
+        train_cfg.get("final_planning_eval_samples", args.final_planning_eval_samples)
+    )
+    args.final_planning_horizon = int(
+        train_cfg.get("final_planning_horizon", args.final_planning_horizon)
+    )
+    args.final_planning_goal_offset = int(
+        train_cfg.get("final_planning_goal_offset", args.final_planning_goal_offset)
+    )
+    args.final_planning_cem_samples = int(
+        train_cfg.get("final_planning_cem_samples", args.final_planning_cem_samples)
+    )
+    args.final_planning_cem_elites = int(
+        train_cfg.get("final_planning_cem_elites", args.final_planning_cem_elites)
+    )
+    args.final_planning_cem_iters = int(
+        train_cfg.get("final_planning_cem_iters", args.final_planning_cem_iters)
+    )
+    args.final_planning_init_std = float(
+        train_cfg.get("final_planning_init_std", args.final_planning_init_std)
+    )
+    args.final_planning_min_std = float(
+        train_cfg.get("final_planning_min_std", args.final_planning_min_std)
+    )
+    args.final_planning_action_penalty = float(
+        train_cfg.get("final_planning_action_penalty", args.final_planning_action_penalty)
+    )
+    args.final_planning_smooth_penalty = float(
+        train_cfg.get("final_planning_smooth_penalty", args.final_planning_smooth_penalty)
+    )
     args.resume_from = optional_path(train_cfg.get("resume_from", args.resume_from))
     args.seed = int(train_cfg.get("seed", args.seed))
     device_value = str(train_cfg.get("device", args.device))

@@ -138,6 +138,19 @@ GPS_MATCH_TOL_MS = 500.0
 
 
 # ---------------------------------------------------------------------------
+# JEPA-style raw session synchronization
+# Before preprocessing, rebuild actions_synced.csv and imu_synced.csv from raw
+# actions/telemetry/IMU when possible. If a session is missing telemetry, the
+# preprocessor still falls back to actions.csv.
+# ---------------------------------------------------------------------------
+SYNC_BEFORE_PREPROCESS = True
+SYNC_CAMERA_DELAY_MS = 100.0
+SYNC_TELEMETRY_GAP_TOL_MS = 60.0
+SYNC_KEEP_ALL_MODES = False
+SYNC_WRITE_IMU = True
+
+
+# ---------------------------------------------------------------------------
 # Missing state policy
 # Android recorder now logs accel/gyro/gps, but not every session will have every file.
 # If a state cannot be matched from row/sensor data, it falls back to these defaults.

@@ -120,6 +120,7 @@ current servo trong data/raw: 181 session
 old servo source: 30 session
 tổng session trong split_vjepa_ac_car.json: 211 session
 missing session so với source hiện có: 0
+actions_synced.csv + imu_synced.csv old-servo: 30/30
 ```
 
 Trong 30 session old servo:
@@ -231,7 +232,7 @@ PYTHONPATH=src python3 -m tools.build_servo_experiment_dataset \
 Kết quả:
 
 ```text
-train samples: 182562
+train samples: 182558
 val samples:   30282
 test samples:  30282  # test alias val
 ```
@@ -254,7 +255,7 @@ old_servo:     train 26,  val 4,  test 4
 Sequence/window count với `raw_frames_per_sample=8`, `frame_stride=2`:
 
 ```text
-train windows: 128617
+train windows: 128566
 val windows:    20501
 test windows:   20501  # test alias val
 ```
@@ -263,7 +264,7 @@ Domain sample count:
 
 ```text
 train current_servo samples: 133677
-train old_servo samples:      48885
+train old_servo samples:      48881
 val current_servo samples:    27360
 val old_servo samples:         2922
 ```
@@ -380,10 +381,10 @@ split_vjepa_ac_car.json:
   missing: 0
 
 servo_old_mix_v1:
-  train samples: 182562
+  train samples: 182558
   val samples: 30282
   test samples: 30282
-  train windows: 128617
+  train windows: 128566
   val windows: 20501
   test windows: 20501
 
@@ -392,4 +393,77 @@ deleted:
   data/processed/features/vjepa2_1_vitb_384_ema_fp32
 ```
 
-Feature extraction thật chưa chạy lại trong bước cập nhật này. Sau khi chạy lệnh extract fp16, cần audit lại metadata trước khi bật train qua đêm.
+## 12. Cập nhật sau khi sync nốt 2 session old-servo
+
+Ngày cập nhật: 2026-06-10.
+
+Hai session old-servo trước đó còn fallback về `actions.csv`:
+
+```text
+session_20260605_225028
+session_20260605_225326
+```
+
+Đã chạy JEPA sensor sync cho cả hai session:
+
+```text
+session_20260605_225028: kept 1156, dropped 1, +imu
+session_20260605_225326: kept 1448, dropped 1, +imu
+```
+
+Sau đó đã rebuild `servo_old_mix_v1` bằng split file cũ và audit lại:
+
+```text
+action_source_counts:
+  actions_synced.csv: 211
+fallback actions.csv: 0
+
+session_20260605_225028:
+  raw_rows: 1156
+  kept_rows: 1121
+  merged_synced_imu_rows: 1156
+  missing_synced_imu_rows: 0
+
+session_20260605_225326:
+  raw_rows: 1448
+  kept_rows: 1423
+  merged_synced_imu_rows: 1448
+  missing_synced_imu_rows: 0
+```
+
+Manifest/sample count mới:
+
+```text
+train samples: 182558
+val samples:   30282
+test samples:  30282  # test alias val
+
+train domain samples:
+  current_servo: 133677
+  old_servo:      48881
+
+val domain samples:
+  current_servo: 27360
+  old_servo:      2922
+```
+
+Feature cache mixed fp16 đã được refresh riêng cho 2 session này. Kết quả extractor:
+
+```text
+extracted: 2
+skipped_compatible: 209
+seeded: 0
+```
+
+Audit feature cache sau cùng:
+
+```text
+features_dir: data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16
+session_count: 211
+frame_count: 212840
+dtype: fp16
+tokens_per_frame: 576
+embed_dim: 768
+missing_count: 0
+bad_count: 0
+```

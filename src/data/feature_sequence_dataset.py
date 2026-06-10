@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from . import settings
 from .dataset import load_manifest
@@ -24,6 +24,66 @@ from .sequence_dataset import (
 
 FEATURE_METADATA_NAME = "metadata.json"
 FEATURE_SESSIONS_DIR_NAME = "sessions"
+EXPECTED_IMAGE_PATH_KEY = "source_frame_path"
+EXPECTED_IMAGE_PATH_FALLBACK = True
+SUPPORTED_FEATURE_SAMPLERS = ("global", "session")
+
+
+class SessionBatchSampler(Sampler[list[int]]):
+    """Yield batches whose windows all come from one session.
+
+    This keeps the per-session feature memmap/cache hot while preserving the
+    causal order inside each sampled window. Training can still randomize by
+    shuffling both session order and window order within each session.
+    """
+
+    def __init__(
+        self,
+        window_session_ids: Sequence[str],
+        batch_size: int,
+        shuffle_sessions: bool,
+        shuffle_windows: bool,
+        drop_last: bool = False,
+        seed: int = settings.RANDOM_SEED,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.batch_size = int(batch_size)
+        self.shuffle_sessions = bool(shuffle_sessions)
+        self.shuffle_windows = bool(shuffle_windows)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.by_session: dict[str, list[int]] = {}
+        for index, session_id in enumerate(window_session_ids):
+            self.by_session.setdefault(str(session_id), []).append(index)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        sessions = list(self.by_session)
+        if self.shuffle_sessions:
+            rng.shuffle(sessions)
+        for session_id in sessions:
+            rows = np.array(self.by_session[session_id], dtype=np.int64)
+            if self.shuffle_windows:
+                rng.shuffle(rows)
+            for start in range(0, len(rows), self.batch_size):
+                batch = rows[start : start + self.batch_size].tolist()
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                yield batch
+
+    def __len__(self) -> int:
+        total = 0
+        for rows in self.by_session.values():
+            if self.drop_last:
+                total += len(rows) // self.batch_size
+            else:
+                total += (len(rows) + self.batch_size - 1) // self.batch_size
+        return total
 
 
 class RCJepaACFeatureSequenceDataset(Dataset):
@@ -84,6 +144,10 @@ class RCJepaACFeatureSequenceDataset(Dataset):
             max_frame_index_gap=self.max_frame_index_gap,
             max_time_gap_sec=self.max_time_gap_sec,
         )
+        self.window_session_ids = [
+            self.window_session_id(window)
+            for window in self.windows
+        ]
 
         session_ids = {str(self.samples[index]["session_id"]) for window in self.windows for index in window}
         self.session_features = {
@@ -93,6 +157,12 @@ class RCJepaACFeatureSequenceDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.windows)
+
+    def window_session_id(self, window: Sequence[int]) -> str:
+        session_ids = {str(self.samples[sample_index]["session_id"]) for sample_index in window}
+        if len(session_ids) != 1:
+            raise ValueError(f"Sequence window crosses sessions: {sorted(session_ids)}")
+        return next(iter(session_ids))
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample_indices = self.windows[index]
@@ -160,7 +230,41 @@ def load_feature_metadata(features_dir: str | Path) -> dict[str, Any]:
     missing = [key for key in required if key not in metadata]
     if missing:
         raise ValueError(f"Feature metadata missing keys: {missing}")
+    validate_feature_image_source(metadata, metadata_path)
     return metadata
+
+
+def validate_feature_image_source(metadata: dict[str, Any], metadata_path: Path) -> None:
+    """Prevent silent training from stale processed-image feature caches.
+
+    Current V-JEPA feature extraction must read the original raw frame path and
+    resize directly to the encoder size. Older caches did not record this field
+    and were usually built from 224px processed images, so they are rejected.
+    """
+    missing = [
+        key
+        for key in ("image_path_key", "image_path_fallback")
+        if key not in metadata
+    ]
+    if missing:
+        raise ValueError(
+            f"Feature metadata {metadata_path} is missing {missing}. "
+            "This cache was likely created by an older extractor and may use "
+            "processed 224px frames. Re-run `tools.extract_vjepa_features` with "
+            "the current code, or choose a feature directory whose metadata has "
+            f"image_path_key={EXPECTED_IMAGE_PATH_KEY!r}."
+        )
+
+    image_path_key = metadata.get("image_path_key")
+    image_path_fallback = bool(metadata.get("image_path_fallback"))
+    if image_path_key != EXPECTED_IMAGE_PATH_KEY or image_path_fallback != EXPECTED_IMAGE_PATH_FALLBACK:
+        raise ValueError(
+            f"Feature metadata {metadata_path} was built with "
+            f"image_path_key={image_path_key!r}, image_path_fallback={image_path_fallback!r}. "
+            f"Expected image_path_key={EXPECTED_IMAGE_PATH_KEY!r}, "
+            f"image_path_fallback={EXPECTED_IMAGE_PATH_FALLBACK!r}. "
+            "Use a matching feature cache or re-extract features."
+        )
 
 
 def load_session_feature_index(features_dir: str | Path, session_id: str) -> SessionFeatureIndex:
@@ -194,6 +298,8 @@ def create_ac_feature_sequence_dataloaders(
     state_columns: Sequence[str] = DEFAULT_AC_STATE_COLUMNS,
     action_columns: Sequence[str] = DEFAULT_AC_ACTION_COLUMNS,
     include_test: bool = True,
+    train_sampler: str = "global",
+    eval_sampler: str = "global",
 ) -> dict[str, DataLoader]:
     batch_size = batch_size or settings.BATCH_SIZE
     eval_batch_size = eval_batch_size or settings.AC_EVAL_BATCH_SIZE
@@ -205,6 +311,8 @@ def create_ac_feature_sequence_dataloaders(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = settings.PREFETCH_FACTOR
+    validate_feature_sampler(train_sampler, name="train_sampler")
+    validate_feature_sampler(eval_sampler, name="eval_sampler")
     manifest_root = Path(manifest_dir or settings.MANIFEST_DIR)
     train_samples = load_manifest(manifest_root / "train.jsonl")
     state_normalizer = (
@@ -237,24 +345,65 @@ def create_ac_feature_sequence_dataloaders(
     }
 
     dataloaders = {
-        "train": DataLoader(
-            datasets["train"],
+        "train": build_feature_dataloader(
+            dataset=datasets["train"],
             batch_size=batch_size,
-            shuffle=settings.SHUFFLE_TRAIN,
-            **loader_kwargs,
+            sampler=train_sampler,
+            shuffle_sessions=settings.SHUFFLE_TRAIN,
+            shuffle_windows=settings.SHUFFLE_TRAIN,
+            loader_kwargs=loader_kwargs,
         ),
-        "val": DataLoader(
-            datasets["val"],
+        "val": build_feature_dataloader(
+            dataset=datasets["val"],
             batch_size=eval_batch_size,
-            shuffle=False,
-            **loader_kwargs,
+            sampler=eval_sampler,
+            shuffle_sessions=False,
+            shuffle_windows=False,
+            loader_kwargs=loader_kwargs,
         ),
     }
     if include_test:
-        dataloaders["test"] = DataLoader(
-            datasets["test"],
+        dataloaders["test"] = build_feature_dataloader(
+            dataset=datasets["test"],
             batch_size=eval_batch_size,
-            shuffle=False,
-            **loader_kwargs,
+            sampler=eval_sampler,
+            shuffle_sessions=False,
+            shuffle_windows=False,
+            loader_kwargs=loader_kwargs,
         )
     return dataloaders
+
+
+def validate_feature_sampler(value: str, name: str) -> None:
+    if value not in SUPPORTED_FEATURE_SAMPLERS:
+        raise ValueError(f"{name} must be one of {SUPPORTED_FEATURE_SAMPLERS}, got {value!r}")
+
+
+def build_feature_dataloader(
+    dataset: RCJepaACFeatureSequenceDataset,
+    batch_size: int,
+    sampler: str,
+    shuffle_sessions: bool,
+    shuffle_windows: bool,
+    loader_kwargs: dict[str, Any],
+) -> DataLoader:
+    if sampler == "global":
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle_windows,
+            **loader_kwargs,
+        )
+    batch_sampler = SessionBatchSampler(
+        window_session_ids=dataset.window_session_ids,
+        batch_size=batch_size,
+        shuffle_sessions=shuffle_sessions,
+        shuffle_windows=shuffle_windows,
+        drop_last=False,
+        seed=settings.RANDOM_SEED,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        **loader_kwargs,
+    )

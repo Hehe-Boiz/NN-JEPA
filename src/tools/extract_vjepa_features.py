@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -37,21 +38,35 @@ from models.vjepa21_presets import (
 DEFAULT_OUTPUT_DIR = vjepa21_feature_output_dir(DEFAULT_VJEPA21_FEATURE_PRESET, "fp16")
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = settings.NUM_WORKERS
+DEFAULT_IMAGE_PATH_KEY = "source_frame_path"
 PROGRESS_PREFIX = "__JOB_PROGRESS__ "
 
 
 class FrameFeatureDataset(Dataset):
     """Frame-level image dataset used only during feature extraction."""
 
-    def __init__(self, samples: Sequence[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        samples: Sequence[dict[str, Any]],
+        *,
+        image_path_key: str = DEFAULT_IMAGE_PATH_KEY,
+        image_path_fallback: bool = True,
+    ) -> None:
         self.samples = list(samples)
+        self.image_path_key = image_path_key
+        self.image_path_fallback = image_path_fallback
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
-        with Image.open(sample["frame_path"]) as image:
+        image_path = resolve_image_path(
+            sample,
+            image_path_key=self.image_path_key,
+            image_path_fallback=self.image_path_fallback,
+        )
+        with Image.open(image_path) as image:
             rgb = image.convert("RGB")
         image_tensor = normalize_tensor(
             image_to_tensor(rgb),
@@ -91,6 +106,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
+    parser.add_argument(
+        "--image-path-key",
+        default=DEFAULT_IMAGE_PATH_KEY,
+        help="Manifest image path key to read. Default source_frame_path uses raw frames before processed 224px images.",
+    )
+    parser.add_argument(
+        "--no-image-path-fallback",
+        action="store_true",
+        help="Fail if --image-path-key is missing instead of falling back to frame_path.",
+    )
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
@@ -115,11 +140,31 @@ def resolve_feature_extraction_args(args: argparse.Namespace) -> argparse.Namesp
         args.checkpoint_key = DEFAULT_CHECKPOINT_KEY if encoder_was_overridden else preset.checkpoint_key
     if args.output_dir is None:
         if encoder_was_overridden:
-            args.output_dir = settings.PROCESSED_DATA_DIR / "features" / f"{args.encoder}_{args.dtype}"
+            args.output_dir = default_features_root(args.manifest_dir) / f"{args.encoder}_{args.dtype}"
         else:
-            args.output_dir = vjepa21_feature_output_dir(args.encoder_preset, args.dtype)
+            preset_dir_name = f"{preset.output_dir_stem}_{args.dtype}"
+            args.output_dir = default_features_root(args.manifest_dir) / preset_dir_name
 
     return args
+
+
+def default_features_root(manifest_dir: Path) -> Path:
+    """Choose a feature root next to custom experiment manifests.
+
+    Baseline manifests keep the historical default under data/processed/features.
+    Experiment manifests such as data/experiments/foo/processed/manifests default
+    to data/experiments/foo/features so they cannot accidentally pollute the
+    baseline feature cache when --output-dir is omitted.
+    """
+    try:
+        if manifest_dir.resolve() == settings.MANIFEST_DIR.resolve():
+            return settings.PROCESSED_DATA_DIR / "features"
+    except OSError:
+        pass
+
+    if manifest_dir.name == "manifests" and manifest_dir.parent.name == "processed":
+        return manifest_dir.parent.parent / "features"
+    return settings.PROCESSED_DATA_DIR / "features"
 
 
 def default_device() -> str:
@@ -195,6 +240,25 @@ def numpy_dtype(dtype_name: str) -> np.dtype:
     raise ValueError(f"Unsupported dtype: {dtype_name}")
 
 
+def resolve_image_path(
+    sample: dict[str, Any],
+    *,
+    image_path_key: str,
+    image_path_fallback: bool,
+) -> Path:
+    value = sample.get(image_path_key)
+    if value in (None, ""):
+        if not image_path_fallback:
+            raise KeyError(f"Sample {sample.get('sample_id')} is missing image path key {image_path_key!r}")
+        value = sample.get("frame_path")
+    if value in (None, ""):
+        raise KeyError(f"Sample {sample.get('sample_id')} has no usable image path")
+    path = Path(str(value))
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found for sample {sample.get('sample_id')}: {path}")
+    return path
+
+
 def build_encoder(args: argparse.Namespace) -> FrozenVJepa21Encoder:
     return FrozenVJepa21Encoder(
         vjepa_root=args.vjepa_root,
@@ -218,6 +282,8 @@ def extract_session_features(
     dtype: np.dtype,
     device: torch.device,
     overwrite: bool,
+    image_path_key: str,
+    image_path_fallback: bool,
 ) -> str:
     npy_path = sessions_dir / f"{session_id}.npy"
     json_path = sessions_dir / f"{session_id}.json"
@@ -233,6 +299,17 @@ def extract_session_features(
                 f"Expected shape={expected_shape}, dtype={dtype}. "
                 "Use --overwrite or a different --output-dir."
             )
+        existing_payload = read_existing_session_metadata(json_path)
+        if existing_payload.get("image_path_key") != image_path_key or bool(
+            existing_payload.get("image_path_fallback", True)
+        ) != bool(image_path_fallback):
+            raise ValueError(
+                f"Existing feature cache for {session_id} was built from "
+                f"image_path_key={existing_payload.get('image_path_key')!r}, "
+                f"fallback={existing_payload.get('image_path_fallback', True)!r}; "
+                f"requested image_path_key={image_path_key!r}, fallback={image_path_fallback!r}. "
+                "Use --overwrite or a different --output-dir so raw-frame and processed-frame features are not mixed."
+            )
         return "skipped_compatible"
 
     feature_array = np.lib.format.open_memmap(
@@ -241,11 +318,18 @@ def extract_session_features(
         dtype=dtype,
         shape=expected_shape,
     )
-    dataset = FrameFeatureDataset(session_samples)
+    dataset = FrameFeatureDataset(
+        session_samples,
+        image_path_key=image_path_key,
+        image_path_fallback=image_path_fallback,
+    )
     loader_kwargs = {
         "num_workers": num_workers,
         "pin_memory": settings.PIN_MEMORY,
-        "persistent_workers": settings.PERSISTENT_WORKERS and num_workers > 0,
+        # A new DataLoader is created per session. Persistent workers are useful
+        # for long-lived train loaders, but here they can leak file descriptors
+        # across hundreds of sessions and eventually hit "Too many open files".
+        "persistent_workers": False,
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = settings.PREFETCH_FACTOR
@@ -265,6 +349,8 @@ def extract_session_features(
         latents = latents.view(images.size(0), tokens_per_frame, embed_dim)
         feature_array[rows] = latents.detach().cpu().numpy().astype(dtype, copy=False)
     feature_array.flush()
+    del dataloader, dataset, feature_array
+    gc.collect()
 
     frames = [
         {
@@ -274,6 +360,7 @@ def extract_session_features(
             "frame_index": int(sample["frame_index"]),
             "timestamp_sec": sample.get("timestamp_sec"),
             "frame_path": sample["frame_path"],
+            "source_frame_path": sample.get("source_frame_path"),
             "splits": sample.get("feature_splits", []),
         }
         for row, sample in enumerate(session_samples)
@@ -287,10 +374,20 @@ def extract_session_features(
             "embed_dim": embed_dim,
             "dtype": str(dtype),
             "feature_path": str(npy_path),
+            "image_path_key": image_path_key,
+            "image_path_fallback": bool(image_path_fallback),
             "frames": frames,
         },
     )
     return "extracted"
+
+
+def read_existing_session_metadata(json_path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def read_existing_metadata(output_dir: Path) -> dict[str, Any] | None:
@@ -320,6 +417,8 @@ def metadata_matches_request(
         "patch_size": args.patch_size,
         "tubelet_size": args.tubelet_size,
         "dtype": args.dtype,
+        "image_path_key": args.image_path_key,
+        "image_path_fallback": not args.no_image_path_fallback,
         "normalization_mean": list(settings.NORMALIZE_MEAN),
         "normalization_std": list(settings.NORMALIZE_STD),
         "manifest_dir": str(args.manifest_dir),
@@ -336,6 +435,8 @@ def cache_status_from_metadata(
     sessions_dir: Path,
     metadata: dict[str, Any],
     dtype: np.dtype,
+    image_path_key: str,
+    image_path_fallback: bool,
 ) -> str:
     npy_path = sessions_dir / f"{session_id}.npy"
     json_path = sessions_dir / f"{session_id}.json"
@@ -350,6 +451,11 @@ def cache_status_from_metadata(
     expected_shape = (len(session_samples), tokens_per_frame, embed_dim)
     if tuple(existing.shape) != expected_shape or np.dtype(existing.dtype) != dtype:
         return "incompatible"
+    payload = read_existing_session_metadata(json_path)
+    if payload.get("image_path_key") != image_path_key or bool(
+        payload.get("image_path_fallback", True)
+    ) != bool(image_path_fallback):
+        return "incompatible"
     return "compatible"
 
 
@@ -358,10 +464,20 @@ def cache_status_summary(
     sessions_dir: Path,
     metadata: dict[str, Any],
     dtype: np.dtype,
+    image_path_key: str,
+    image_path_fallback: bool,
 ) -> dict[str, int]:
     summary = {"compatible": 0, "missing": 0, "incompatible": 0}
     for session_id, session_samples in grouped.items():
-        status = cache_status_from_metadata(session_id, session_samples, sessions_dir, metadata, dtype)
+        status = cache_status_from_metadata(
+            session_id,
+            session_samples,
+            sessions_dir,
+            metadata,
+            dtype,
+            image_path_key=image_path_key,
+            image_path_fallback=image_path_fallback,
+        )
         summary[status] += 1
     return summary
 
@@ -375,6 +491,8 @@ def seed_feature_cache_from_dir(
     embed_dim: int,
     dtype: np.dtype,
     overwrite: bool,
+    image_path_key: str,
+    image_path_fallback: bool,
 ) -> dict[str, int]:
     summary = {"seeded": 0, "already_present": 0, "missing": 0, "incompatible": 0, "skipped": 0}
     if seed_dir is None:
@@ -399,6 +517,8 @@ def seed_feature_cache_from_dir(
         tokens_per_frame=tokens_per_frame,
         embed_dim=embed_dim,
         dtype=dtype,
+        image_path_key=image_path_key,
+        image_path_fallback=image_path_fallback,
     ):
         summary["incompatible"] = len(grouped)
         return summary
@@ -425,6 +545,12 @@ def seed_feature_cache_from_dir(
         if tuple(existing.shape) != expected_shape or np.dtype(existing.dtype) != dtype:
             summary["incompatible"] += 1
             continue
+        source_payload = read_existing_session_metadata(source_json)
+        if source_payload.get("image_path_key") != image_path_key or bool(
+            source_payload.get("image_path_fallback", True)
+        ) != bool(image_path_fallback):
+            summary["incompatible"] += 1
+            continue
 
         for source_path, target_path in ((source_npy, target_npy), (source_json, target_json)):
             if target_path.exists():
@@ -440,6 +566,8 @@ def seed_metadata_is_compatible_for_seed(
     tokens_per_frame: int,
     embed_dim: int,
     dtype: np.dtype,
+    image_path_key: str,
+    image_path_fallback: bool,
 ) -> bool:
     """Check encoder-level metadata before reusing per-session feature files.
 
@@ -453,6 +581,8 @@ def seed_metadata_is_compatible_for_seed(
         "tokens_per_frame": tokens_per_frame,
         "embed_dim": embed_dim,
         "dtype": "fp16" if dtype == np.dtype(np.float16) else "fp32",
+        "image_path_key": image_path_key,
+        "image_path_fallback": bool(image_path_fallback),
         "encoder_name": args.encoder,
         "checkpoint_key": args.checkpoint_key,
         "image_size": args.image_size,
@@ -500,14 +630,22 @@ def main() -> None:
 
     if not args.overwrite:
         existing_metadata = read_existing_metadata(args.output_dir)
-        if existing_metadata is not None and metadata_matches_request(
-            existing_metadata,
-            args=args,
-            grouped=grouped,
-            frame_count=len(samples),
-        ):
-            status_summary = cache_status_summary(grouped, sessions_dir, existing_metadata, dtype)
-            if status_summary["compatible"] == len(grouped):
+        if existing_metadata is not None:
+            status_summary = cache_status_summary(
+                grouped,
+                sessions_dir,
+                existing_metadata,
+                dtype,
+                image_path_key=args.image_path_key,
+                image_path_fallback=not args.no_image_path_fallback,
+            )
+            metadata_matches = metadata_matches_request(
+                existing_metadata,
+                args=args,
+                grouped=grouped,
+                frame_count=len(samples),
+            )
+            if metadata_matches and status_summary["compatible"] == len(grouped):
                 print_progress(100, "Feature cache already complete", current=len(grouped), total=len(grouped))
                 print(
                     json.dumps(
@@ -526,6 +664,12 @@ def main() -> None:
                     flush=True,
                 )
                 return
+            if not metadata_matches and (status_summary["compatible"] > 0 or status_summary["incompatible"] > 0):
+                raise ValueError(
+                    "Existing feature cache metadata does not match the requested extraction settings. "
+                    f"status={status_summary}. Use --overwrite to rebuild in place, or choose a new --output-dir. "
+                    "This prevents mixing processed-frame features with raw-frame features."
+                )
 
     print_progress(5, "Loading frozen V-JEPA encoder", indeterminate=True)
     device = torch.device(args.device)
@@ -546,6 +690,8 @@ def main() -> None:
         "tokens_per_frame": encoder.tokens_per_frame,
         "embed_dim": encoder.embed_dim,
         "dtype": args.dtype,
+        "image_path_key": args.image_path_key,
+        "image_path_fallback": not args.no_image_path_fallback,
         "normalization_mean": list(settings.NORMALIZE_MEAN),
         "normalization_std": list(settings.NORMALIZE_STD),
         "manifest_dir": str(args.manifest_dir),
@@ -565,6 +711,8 @@ def main() -> None:
         embed_dim=encoder.embed_dim,
         dtype=dtype,
         overwrite=args.overwrite,
+        image_path_key=args.image_path_key,
+        image_path_fallback=not args.no_image_path_fallback,
     )
     if args.seed_from_features_dir is not None:
         print(json.dumps({"feature_seed_summary": seed_summary}, indent=2), flush=True)
@@ -589,6 +737,8 @@ def main() -> None:
                 dtype=dtype,
                 device=device,
                 overwrite=args.overwrite,
+                image_path_key=args.image_path_key,
+                image_path_fallback=not args.no_image_path_fallback,
             )
             feature_summary[status] = feature_summary.get(status, 0) + 1
     print_progress(100, "Feature extraction complete", current=total_sessions, total=total_sessions)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import random
 import sys
@@ -10,13 +11,17 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 
 from data import settings
-from data.feature_sequence_dataset import create_ac_feature_sequence_dataloaders
+from data.feature_sequence_dataset import (
+    SUPPORTED_FEATURE_SAMPLERS,
+    create_ac_feature_sequence_dataloaders,
+)
 from data.normalization import normalizer_to_dict
 from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS
 from models.rc_jepa_ac import (
@@ -25,6 +30,7 @@ from models.rc_jepa_ac import (
     SUPPORTED_PREDICTOR_TYPES,
     apply_predictor_size_preset,
     build_ac_predictor,
+    build_rollout_state_context,
     compute_world_model_losses,
     count_trainable_parameters,
 )
@@ -45,6 +51,10 @@ from tools.train_rc_jepa_ac import (
     compute_warmup_steps,
     should_apply_early_stopping,
     sync_lr_scheduler,
+)
+from tools.rc_jepa_ac_cem_planner import (
+    RCJepaACFeatureCEMPlanner,
+    denormalize_action_tensor,
 )
 from tools.wandb_utils import (
     add_wandb_args,
@@ -85,6 +95,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--eval-batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
+    parser.add_argument(
+        "--train-sampler",
+        choices=SUPPORTED_FEATURE_SAMPLERS,
+        default="global",
+        help="Train sampler. global preserves old behavior; session keeps each batch within one session.",
+    )
+    parser.add_argument(
+        "--eval-sampler",
+        choices=SUPPORTED_FEATURE_SAMPLERS,
+        default="global",
+        help="Val/test sampler. session keeps batch boundaries within one session.",
+    )
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
@@ -92,6 +114,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-start-factor", type=float, default=DEFAULT_WARMUP_START_FACTOR)
     parser.add_argument("--min-lr-ratio", type=float, default=DEFAULT_MIN_LR_RATIO)
     parser.add_argument("--early-stopping-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="Forward/loss autocast dtype. bf16 matches V-JEPA AC style on CUDA; fp32 disables autocast.",
+    )
+    parser.add_argument(
+        "--final-eval-horizon",
+        type=int,
+        default=3,
+        help="Final val rollout-vs-identity horizon after training. 0 disables final eval.",
+    )
+    parser.add_argument(
+        "--val-rollout-eval-horizon",
+        type=int,
+        default=0,
+        help="Optional rollout-vs-identity horizon to log on val after each epoch. 0 disables per-epoch rollout eval.",
+    )
+    parser.add_argument(
+        "--val-rollout-eval-max-batches",
+        type=int,
+        default=256,
+        help="Maximum val batches for per-epoch rollout eval. 0 means full val split.",
+    )
+    parser.add_argument(
+        "--final-planning-eval-samples",
+        type=int,
+        default=0,
+        help="Number of val samples for final offline CEM planning eval. 0 disables planning eval.",
+    )
+    parser.add_argument(
+        "--final-planning-horizon",
+        type=int,
+        default=0,
+        help="CEM planning horizon for final planning eval. 0 means auto_steps.",
+    )
+    parser.add_argument(
+        "--final-planning-goal-offset",
+        type=int,
+        default=0,
+        help="Goal frame offset for final planning eval. 0 means final_planning_horizon.",
+    )
+    parser.add_argument("--final-planning-cem-samples", type=int, default=64)
+    parser.add_argument("--final-planning-cem-elites", type=int, default=8)
+    parser.add_argument("--final-planning-cem-iters", type=int, default=3)
+    parser.add_argument("--final-planning-init-std", type=float, default=0.5)
+    parser.add_argument("--final-planning-min-std", type=float, default=0.05)
+    parser.add_argument("--final-planning-action-penalty", type=float, default=0.0)
+    parser.add_argument("--final-planning-smooth-penalty", type=float, default=0.0)
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
     parser.add_argument("--device", type=str, default=default_device())
@@ -135,6 +206,15 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def autocast_context(device: torch.device, amp_dtype: str):
+    """Return an autocast context for predictor forward/loss only."""
+    if amp_dtype == "fp32" or device.type != "cuda":
+        return nullcontext()
+    if amp_dtype == "bf16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    raise ValueError(f"Unsupported amp_dtype={amp_dtype!r}")
+
+
 def build_predictor(args: argparse.Namespace, tokens_per_frame: int, embed_dim: int) -> nn.Module:
     return build_ac_predictor(
         predictor_type=args.predictor_type,
@@ -148,6 +228,17 @@ def build_predictor(args: argparse.Namespace, tokens_per_frame: int, embed_dim: 
         num_heads=args.predictor_heads,
         dropout=args.dropout,
     )
+
+
+def set_dataloader_epoch(dataloader: torch.utils.data.DataLoader, epoch: int) -> None:
+    """Let custom samplers reshuffle deterministically for a new epoch."""
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+        return
+    sampler = getattr(dataloader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
 
 
 def run_epoch(
@@ -170,6 +261,7 @@ def run_epoch(
     global_step_start: int = 0,
     wandb_grad_stats_every: int = 0,
     wandb_param_stats_every: int = 0,
+    amp_dtype: str = "fp32",
 ) -> tuple[dict[str, float], int]:
     training = optimizer is not None
     predictor.train(training)
@@ -208,7 +300,7 @@ def run_epoch(
         else:
             current_lr = None
 
-        with torch.set_grad_enabled(training):
+        with torch.set_grad_enabled(training), autocast_context(device, amp_dtype):
             outputs = compute_world_model_losses(
                 predictor=predictor,
                 latents=latents,
@@ -295,6 +387,271 @@ def run_epoch(
 
 def average_metrics(totals: dict[str, float], total_samples: int) -> dict[str, float]:
     return {key: value / max(total_samples, 1) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def final_rollout_identity_eval(
+    predictor: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    tokens_per_frame: int,
+    horizon: int,
+    state_columns: tuple[str, ...],
+    action_columns: tuple[str, ...],
+    show_progress: bool,
+    amp_dtype: str = "fp32",
+    max_batches: int = 0,
+    label: str = "final val rollout",
+) -> dict[str, float]:
+    """Compare autoregressive rollout against an identity latent baseline on val."""
+    if horizon < 1:
+        return {}
+
+    predictor.eval()
+    model_totals: dict[int, float] = {}
+    identity_totals: dict[int, float] = {}
+    count = 0
+    progress = tqdm(dataloader, desc=label, leave=False, disable=not show_progress)
+    for batch_index, batch in enumerate(progress, start=1):
+        if max_batches > 0 and batch_index > max_batches:
+            break
+        latents = batch["latents"].to(device, non_blocking=True)
+        states = batch["states"].to(device, non_blocking=True)
+        actions = batch["actions"].to(device, non_blocking=True)
+        batch_size = latents.size(0)
+        num_frames = states.size(1)
+        max_horizon = min(int(horizon), num_frames - 1)
+        if max_horizon < 1:
+            continue
+
+        first_tokens = latents[:, :tokens_per_frame]
+        rollout_tokens = first_tokens
+        rollout_states = build_rollout_state_context(
+            initial_state=states[:, :1],
+            actions=actions,
+            rollout_steps=max_horizon,
+            state_columns=state_columns,
+            action_columns=action_columns,
+        )
+
+        predictions: list[torch.Tensor] = []
+        for step in range(max_horizon):
+            with autocast_context(device, amp_dtype):
+                pred_tokens = predictor(
+                    latent_tokens=rollout_tokens,
+                    actions=actions[:, : step + 1],
+                    states=rollout_states[:, : step + 1],
+                    tokens_per_frame=tokens_per_frame,
+                )
+            next_tokens = pred_tokens[:, -tokens_per_frame:]
+            predictions.append(next_tokens)
+            rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+
+        for step, predicted in enumerate(predictions, start=1):
+            target_start = step * tokens_per_frame
+            target = latents[:, target_start : target_start + tokens_per_frame]
+            model_l1 = torch.nn.functional.l1_loss(predicted, target, reduction="none").mean(dim=(1, 2))
+            identity_l1 = torch.nn.functional.l1_loss(first_tokens, target, reduction="none").mean(dim=(1, 2))
+            model_totals[step] = model_totals.get(step, 0.0) + float(model_l1.sum().detach().cpu())
+            identity_totals[step] = identity_totals.get(step, 0.0) + float(identity_l1.sum().detach().cpu())
+        count += batch_size
+
+    metrics: dict[str, float] = {}
+    for step in sorted(model_totals):
+        model_l1 = model_totals[step] / max(count, 1)
+        identity_l1 = identity_totals[step] / max(count, 1)
+        metrics[f"rollout_l1_h{step}"] = model_l1
+        metrics[f"identity_l1_h{step}"] = identity_l1
+        metrics[f"ratio_h{step}"] = model_l1 / max(identity_l1, 1e-12)
+    if max_batches > 0:
+        metrics["sampled_batches"] = float(min(max_batches, len(dataloader)))
+    metrics["sampled_samples"] = float(count)
+    return metrics
+
+
+def resolve_positive_horizon(value: int, fallback: int, raw_frames_per_sample: int, name: str) -> int:
+    horizon = fallback if value == 0 else value
+    if horizon < 1:
+        raise ValueError(f"{name} must be >= 1")
+    if horizon > raw_frames_per_sample - 1:
+        raise ValueError(
+            f"{name}={horizon} exceeds available future frames={raw_frames_per_sample - 1}"
+        )
+    return int(horizon)
+
+
+def action_bounds_for_columns(action_columns: tuple[str, ...]) -> tuple[list[float], list[float]]:
+    low_by_column = {
+        "steering_cmd_t": settings.STEERING_MIN,
+        "throttle_cmd_t": settings.THROTTLE_MIN,
+    }
+    high_by_column = {
+        "steering_cmd_t": settings.STEERING_MAX,
+        "throttle_cmd_t": settings.THROTTLE_MAX,
+    }
+    return (
+        [float(low_by_column.get(column, -1.0)) for column in action_columns],
+        [float(high_by_column.get(column, 1.0)) for column in action_columns],
+    )
+
+
+def final_prediction_l1(predictions: torch.Tensor, goal_tokens: torch.Tensor) -> float:
+    goal = goal_tokens
+    if goal.ndim == 2:
+        goal = goal.unsqueeze(0)
+    return float(F.l1_loss(predictions[:, -1], goal, reduction="none").mean().detach().cpu())
+
+
+@torch.no_grad()
+def final_planning_eval(
+    predictor: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    tokens_per_frame: int,
+    horizon: int,
+    goal_offset: int,
+    max_samples: int,
+    state_columns: tuple[str, ...],
+    action_columns: tuple[str, ...],
+    cem_samples: int,
+    cem_elites: int,
+    cem_iters: int,
+    init_std: float,
+    min_std: float,
+    action_penalty: float,
+    smooth_penalty: float,
+    show_progress: bool,
+) -> dict[str, float]:
+    """Run a small offline CEM planning eval on val using the trained world model."""
+    if max_samples < 1:
+        return {}
+    if horizon < 1:
+        raise ValueError("final planning horizon must be >= 1")
+    if goal_offset < 1:
+        raise ValueError("final planning goal offset must be >= 1")
+    if cem_samples < 1:
+        raise ValueError("final planning CEM samples must be >= 1")
+    if cem_elites < 1 or cem_elites > cem_samples:
+        raise ValueError("final planning CEM elites must be in [1, cem_samples]")
+    if cem_iters < 1:
+        raise ValueError("final planning CEM iters must be >= 1")
+
+    predictor.eval()
+    action_low, action_high = action_bounds_for_columns(action_columns)
+    split_dataset = dataloader.dataset
+    action_normalizer = getattr(split_dataset, "action_normalizer", None)
+    planner = RCJepaACFeatureCEMPlanner(
+        predictor=predictor,
+        tokens_per_frame=tokens_per_frame,
+        state_columns=state_columns,
+        action_columns=action_columns,
+        action_normalizer=action_normalizer,
+        horizon=horizon,
+        n_samples=cem_samples,
+        n_elite=cem_elites,
+        n_iter=cem_iters,
+        action_low=action_low,
+        action_high=action_high,
+        init_std=init_std,
+        min_std=min_std,
+        action_penalty=action_penalty,
+        smooth_penalty=smooth_penalty,
+        device=device,
+    )
+
+    total_planned_l1 = 0.0
+    total_groundtruth_l1 = 0.0
+    total_zero_l1 = 0.0
+    total_planned_score = 0.0
+    total_first_action_mae = 0.0
+    total_first_action_mae_by_column = [0.0 for _ in action_columns]
+    count = 0
+
+    progress = tqdm(dataloader, desc="final val planning", leave=False, disable=not show_progress)
+    for batch in progress:
+        if count >= max_samples:
+            break
+        latents = batch["latents"].to(device, non_blocking=True)
+        states = batch["states"].to(device, non_blocking=True)
+        model_actions = batch["actions"].to(device, non_blocking=True)
+        batch_size = latents.size(0)
+        for row in range(batch_size):
+            if count >= max_samples:
+                break
+
+            context_tokens = latents[row, :tokens_per_frame]
+            goal_start = goal_offset * tokens_per_frame
+            goal_end = goal_start + tokens_per_frame
+            goal_tokens = latents[row, goal_start:goal_end]
+            initial_state = states[row, 0]
+            plan = planner.plan(
+                context_tokens=context_tokens,
+                initial_state=initial_state,
+                goal_tokens=goal_tokens,
+            )
+
+            planned_actions = plan.action_sequence.to(device).unsqueeze(0)
+            groundtruth_actions = denormalize_action_tensor(
+                model_actions[row : row + 1, :horizon],
+                action_columns=action_columns,
+                action_normalizer=action_normalizer,
+            )
+            zero_actions = torch.zeros_like(planned_actions)
+            goal_batched = goal_tokens.unsqueeze(0)
+
+            planned_predictions = planner.rollout(context_tokens, initial_state, planned_actions)
+            groundtruth_predictions = planner.rollout(context_tokens, initial_state, groundtruth_actions)
+            zero_predictions = planner.rollout(context_tokens, initial_state, zero_actions)
+
+            planned_l1 = final_prediction_l1(planned_predictions, goal_batched)
+            groundtruth_l1 = final_prediction_l1(groundtruth_predictions, goal_batched)
+            zero_l1 = final_prediction_l1(zero_predictions, goal_batched)
+            planned_first = plan.first_action
+            groundtruth_first = groundtruth_actions[0, 0].detach().cpu()
+            first_abs_error = (planned_first - groundtruth_first).abs()
+
+            total_planned_l1 += planned_l1
+            total_groundtruth_l1 += groundtruth_l1
+            total_zero_l1 += zero_l1
+            total_planned_score += float(plan.score)
+            total_first_action_mae += float(first_abs_error.mean())
+            for index in range(len(action_columns)):
+                total_first_action_mae_by_column[index] += float(first_abs_error[index])
+            count += 1
+            progress.set_postfix(
+                {
+                    "samples": count,
+                    "planned_l1": planned_l1,
+                    "gt_l1": groundtruth_l1,
+                }
+            )
+
+    metrics: dict[str, float] = {"sampled_samples": float(count)}
+    if count < 1:
+        return metrics
+
+    mean_planned_l1 = total_planned_l1 / count
+    mean_groundtruth_l1 = total_groundtruth_l1 / count
+    mean_zero_l1 = total_zero_l1 / count
+    metrics.update(
+        {
+            "mean_planned_final_l1": mean_planned_l1,
+            "mean_groundtruth_final_l1": mean_groundtruth_l1,
+            "mean_zero_action_final_l1": mean_zero_l1,
+            "planned_zero_ratio": mean_planned_l1 / max(mean_zero_l1, 1e-12),
+            "planned_groundtruth_ratio": mean_planned_l1 / max(mean_groundtruth_l1, 1e-12),
+            "mean_planned_score": total_planned_score / count,
+            "mean_first_action_mae": total_first_action_mae / count,
+            "horizon": float(horizon),
+            "goal_offset": float(goal_offset),
+            "cem_samples": float(cem_samples),
+            "cem_elites": float(cem_elites),
+            "cem_iters": float(cem_iters),
+        }
+    )
+    for column, total in zip(action_columns, total_first_action_mae_by_column, strict=True):
+        metrics[f"mean_first_action_mae/{column}"] = total / count
+    return metrics
 
 
 def collect_normalization_metadata(dataset: Any) -> dict[str, Any]:
@@ -411,6 +768,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "predictor_depth",
         "predictor_heads",
         "dropout",
+        "amp_dtype",
     )
     mismatches = []
     for field in checked_fields:
@@ -474,6 +832,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         state_columns=args.state_columns,
         action_columns=args.action_columns,
         include_test=not args.skip_test,
+        train_sampler=args.train_sampler,
+        eval_sampler=args.eval_sampler,
     )
     train_dataset = dataloaders["train"].dataset
     tokens_per_frame = int(train_dataset.tokens_per_frame)
@@ -503,6 +863,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         "steps_per_epoch": steps_per_epoch,
         "total_train_steps": total_train_steps,
         "warmup_steps": warmup_steps,
+        "train_sampler": args.train_sampler,
+        "eval_sampler": args.eval_sampler,
         "normalization": normalization_metadata,
         "feature_metadata": feature_metadata,
         "args": args_to_jsonable_dict(args),
@@ -558,6 +920,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         final_epoch = start_epoch - 1
         for epoch in range(start_epoch, args.epochs + 1):
             final_epoch = epoch
+            set_dataloader_epoch(dataloaders["train"], epoch)
             if epoch == start_epoch and resume_phase == "train_complete_waiting_val" and resumed_train_metrics is not None:
                 train_metrics = resumed_train_metrics
             else:
@@ -581,6 +944,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     global_step_start=global_step,
                     wandb_grad_stats_every=args.wandb_grad_stats_every,
                     wandb_param_stats_every=args.wandb_param_stats_every,
+                    amp_dtype=args.amp_dtype,
                 )
                 train_only_metrics = {"epoch": epoch, "train": train_metrics}
                 save_checkpoint(
@@ -616,11 +980,46 @@ def main(args: argparse.Namespace | None = None) -> None:
                     action_columns=tuple(args.action_columns),
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val",
                     show_progress=not args.no_progress,
+                    amp_dtype=args.amp_dtype,
                 )
+            if args.val_rollout_eval_horizon > 0:
+                maybe_cleanup_cuda()
+                val_rollout_metrics = final_rollout_identity_eval(
+                    predictor=predictor,
+                    dataloader=dataloaders["val"],
+                    device=device,
+                    tokens_per_frame=tokens_per_frame,
+                    horizon=args.val_rollout_eval_horizon,
+                    state_columns=tuple(args.state_columns),
+                    action_columns=tuple(args.action_columns),
+                    show_progress=not args.no_progress,
+                    amp_dtype=args.amp_dtype,
+                    max_batches=args.val_rollout_eval_max_batches,
+                    label=f"epoch {epoch:03d}/{args.epochs:03d} val rollout",
+                )
+                val_metrics.update(val_rollout_metrics)
 
             epoch_metrics = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
             history.append(epoch_metrics)
             write_json(args.output_dir / "history.json", history)
+            rollout_suffix = ""
+            rollout_steps = sorted(
+                int(key.removeprefix("ratio_h"))
+                for key in val_metrics
+                if key.startswith("ratio_h")
+            )
+            if rollout_steps:
+                rollout_parts: list[str] = []
+                for step in rollout_steps:
+                    for prefix, precision in (
+                        ("rollout_l1", 5),
+                        ("identity_l1", 5),
+                        ("ratio", 3),
+                    ):
+                        key = f"{prefix}_h{step}"
+                        if key in val_metrics:
+                            rollout_parts.append(f"val_{key}={val_metrics[key]:.{precision}f}")
+                rollout_suffix = " " + " ".join(rollout_parts)
             print(
                 f"[epoch {epoch:03d}] "
                 f"train_loss={train_metrics['loss']:.5f} "
@@ -628,7 +1027,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                 f"train_tf={train_metrics['teacher_forcing_loss']:.5f} "
                 f"val_tf={val_metrics['teacher_forcing_loss']:.5f} "
                 f"train_rollout={train_metrics['rollout_loss']:.5f} "
-                f"val_rollout={val_metrics['rollout_loss']:.5f}",
+                f"val_rollout={val_metrics['rollout_loss']:.5f}"
+                f"{rollout_suffix}",
                 flush=True,
             )
 
@@ -717,6 +1117,90 @@ def main(args: argparse.Namespace | None = None) -> None:
             "resume_from": None if resumed_from is None else str(resumed_from),
             "test_skipped": bool(args.skip_test),
         }
+        final_eval_metrics: dict[str, float] = {}
+        final_planning_metrics: dict[str, float] = {}
+        if args.final_eval_horizon > 0 or args.final_planning_eval_samples > 0:
+            best_checkpoint = torch.load(args.output_dir / "best.pt", map_location=device)
+            predictor.load_state_dict(best_checkpoint["predictor_state_dict"])
+            optimizer.zero_grad(set_to_none=True)
+            maybe_cleanup_cuda()
+
+        if args.final_eval_horizon > 0:
+            final_eval_metrics = final_rollout_identity_eval(
+                predictor=predictor,
+                dataloader=dataloaders["val"],
+                device=device,
+                tokens_per_frame=tokens_per_frame,
+                horizon=args.final_eval_horizon,
+                state_columns=tuple(args.state_columns),
+                action_columns=tuple(args.action_columns),
+                show_progress=not args.no_progress,
+                amp_dtype=args.amp_dtype,
+            )
+            final_eval_payload = {
+                "split": "val",
+                "horizon": args.final_eval_horizon,
+                "metrics": final_eval_metrics,
+            }
+            write_json(args.output_dir / "final_eval_val.json", final_eval_payload)
+            result["final_eval_val"] = final_eval_metrics
+            log_metrics(
+                wandb_run,
+                flatten_metrics("final_eval_val", final_eval_metrics),
+                step=max(global_step, 1),
+            )
+            update_summary(
+                wandb_run,
+                {f"final_eval_val/{key}": value for key, value in final_eval_metrics.items()},
+            )
+        if args.final_planning_eval_samples > 0:
+            maybe_cleanup_cuda()
+            planning_horizon = resolve_positive_horizon(
+                value=args.final_planning_horizon,
+                fallback=args.auto_steps,
+                raw_frames_per_sample=args.raw_frames_per_sample,
+                name="final_planning_horizon",
+            )
+            planning_goal_offset = resolve_positive_horizon(
+                value=args.final_planning_goal_offset,
+                fallback=planning_horizon,
+                raw_frames_per_sample=args.raw_frames_per_sample,
+                name="final_planning_goal_offset",
+            )
+            final_planning_metrics = final_planning_eval(
+                predictor=predictor,
+                dataloader=dataloaders["val"],
+                device=device,
+                tokens_per_frame=tokens_per_frame,
+                horizon=planning_horizon,
+                goal_offset=planning_goal_offset,
+                max_samples=args.final_planning_eval_samples,
+                state_columns=tuple(args.state_columns),
+                action_columns=tuple(args.action_columns),
+                cem_samples=args.final_planning_cem_samples,
+                cem_elites=args.final_planning_cem_elites,
+                cem_iters=args.final_planning_cem_iters,
+                init_std=args.final_planning_init_std,
+                min_std=args.final_planning_min_std,
+                action_penalty=args.final_planning_action_penalty,
+                smooth_penalty=args.final_planning_smooth_penalty,
+                show_progress=not args.no_progress,
+            )
+            final_planning_payload = {
+                "split": "val",
+                "metrics": final_planning_metrics,
+            }
+            write_json(args.output_dir / "final_planning_val.json", final_planning_payload)
+            result["final_planning_val"] = final_planning_metrics
+            log_metrics(
+                wandb_run,
+                flatten_metrics("final_planning_val", final_planning_metrics),
+                step=max(global_step, 1),
+            )
+            update_summary(
+                wandb_run,
+                {f"final_planning_val/{key}": value for key, value in final_planning_metrics.items()},
+            )
         if args.skip_test:
             write_json(args.output_dir / "final_metrics.json", result)
             log_metrics(wandb_run, {"best/val_loss": best_val_loss}, step=max(global_step, 1))
@@ -742,6 +1226,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 action_columns=tuple(args.action_columns),
                 label="test",
                 show_progress=not args.no_progress,
+                amp_dtype=args.amp_dtype,
             )
 
         result["test"] = test_metrics
