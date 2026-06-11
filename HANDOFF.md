@@ -38,6 +38,7 @@ RoPE rotation: khớp source vjepa2, max diff = 0.0
 per-epoch val rollout-vs-identity metrics: đã thêm, py_compile pass, Hydra dry-run base mixed pass
 final planning eval: đã thêm `final_planning_val/*` optional cuối train trên best.pt
 feature train sampler: giữ `global` mặc định, official-lite mixed dùng `train_sampler=session`, `eval_sampler=session`
+W&B loss aliases: `train/loss`, `train/tf`, `train/rollout`, `train/lr`, `val/loss`, `final/rollout1_ratio` giống JEPA; official-lite mixed log batch mỗi 50 step; epoch train aggregate nằm ở `train_epoch/*`
 git diff --check: pass
 ```
 

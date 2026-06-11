@@ -17,6 +17,7 @@ DEFAULT_WANDB_WATCH_LOG = "gradients"
 DEFAULT_WANDB_WATCH_FREQ = 200
 DEFAULT_WANDB_GRAD_STATS_EVERY = 20
 DEFAULT_WANDB_PARAM_STATS_EVERY = 200
+DEFAULT_WANDB_LOG_EVERY = 50
 WANDB_RUN_ID_FILENAME = "wandb_run_id.txt"
 
 
@@ -47,7 +48,7 @@ def add_wandb_args(parser: Any) -> None:
     )
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb-tags", nargs="*", default=[])
-    parser.add_argument("--wandb-log-every", type=int, default=20)
+    parser.add_argument("--wandb-log-every", type=int, default=DEFAULT_WANDB_LOG_EVERY)
     parser.add_argument("--wandb-watch-log", choices=["none", "gradients", "parameters", "all"], default=DEFAULT_WANDB_WATCH_LOG)
     parser.add_argument("--wandb-watch-freq", type=int, default=DEFAULT_WANDB_WATCH_FREQ)
     parser.add_argument("--wandb-grad-stats-every", type=int, default=DEFAULT_WANDB_GRAD_STATS_EVERY)

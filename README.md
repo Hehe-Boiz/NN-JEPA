@@ -270,7 +270,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac \
   --warmup-start-factor 0.1 \
   --min-lr-ratio 0.1 \
   --early-stopping-patience 15 \
-  --wandb-log-every 20
+  --wandb-log-every 50
 ```
 
 Lưu ý:
@@ -615,7 +615,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --warmup-start-factor 0.1 \
   --min-lr-ratio 0.1 \
   --early-stopping-patience 15 \
-  --wandb-log-every 20 \
+  --wandb-log-every 50 \
   --wandb-watch-log all \
   --wandb-watch-freq 100 \
   --wandb-grad-stats-every 10 \
@@ -726,7 +726,7 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --warmup-start-factor 0.1 \
   --min-lr-ratio 0.1 \
   --early-stopping-patience 15 \
-  --wandb-log-every 20 \
+  --wandb-log-every 50 \
   --wandb-watch-log gradients \
   --wandb-watch-freq 200 \
   --wandb-grad-stats-every 20 \
@@ -1365,9 +1365,27 @@ metrics: train/*, val/*, test/*, best/val_loss, lr
 
 Tất cả metric/loss mà loop đang trả về đều được log lên W&B.
 
-Với `tools.train_rc_jepa_ac_features`, mặc định chỉ có `train/*`, `train_batch/*`, `val/*`, `best/*`, `lr`. `test/*` chỉ có nếu bật `--run-test` hoặc chạy eval/test riêng.
+Với `tools.train_rc_jepa_ac_features`, W&B loss keys đã được đặt giống `JEPA/src/jepa_wm/engine/train_ac_car.py`:
 
-Ngoài metric theo epoch, loop train còn log thêm `train_batch/*` theo batch để nhìn thấy loss curve ngay trong lúc epoch đang chạy.
+```text
+train/loss       batch train loss
+train/tf         batch teacher-forcing loss
+train/rollout    batch rollout loss
+train/lr         batch learning rate
+val/loss         epoch validation loss
+epoch            epoch index
+```
+
+Để không làm mất debug cũ, NN-JEPA vẫn log thêm:
+
+```text
+train_batch/*    batch metrics chi tiết, gradient, parameter
+train_epoch/*    train aggregate sau mỗi epoch
+val/tf           validation teacher-forcing loss
+val/rollout      validation rollout loss
+best/*
+final/*
+```
 
 Với config official-lite mixed, `val_rollout_eval_horizon=3` nên sau mỗi epoch có thêm metric rollout-vs-identity trên val:
 
@@ -1390,7 +1408,8 @@ Cuối train, nếu `final_planning_eval_samples > 0`, script cũng log `final_p
 Trục step trên W&B:
 
 - `train_batch/*` log theo `global_step`.
-- `train/*`, `val/*`, `best/*` cũng log theo `global_step`.
+- `train/loss`, `train/tf`, `train/rollout`, `train/lr` log theo `global_step` giống JEPA; các config official-lite mixed mặc định log mỗi `50` step như `JEPA/src/jepa_wm/engine/train_ac_car.py`.
+- `train_epoch/*`, `val/*`, `best/*` log theo `global_step` cuối epoch.
 - `test/*` chỉ log khi có chạy test.
 - Không dùng `epoch` làm W&B step, để tránh trường hợp step đi lùi và W&B bỏ qua metric.
 - Metric vẫn có field `epoch`, nên vẫn lọc/xem theo epoch được.
@@ -1452,14 +1471,23 @@ Ví dụ với `rc_jepa_ac`:
 
 ```text
 train/loss
-train/teacher_forcing_loss
-train/rollout_loss
+train/tf
+train/rollout
+train/lr
+train_epoch/loss
+train_epoch/tf
+train_epoch/rollout
 val/loss
-val/teacher_forcing_loss
-val/rollout_loss
+val/tf
+val/rollout
 val/rollout_l1_h1
 val/identity_l1_h1
 val/ratio_h1
+final/best_val
+final/rollout1
+final/rollout1_ratio
+final/rollout3
+final/rollout3_ratio
 test/loss
 test/teacher_forcing_loss
 test/rollout_loss

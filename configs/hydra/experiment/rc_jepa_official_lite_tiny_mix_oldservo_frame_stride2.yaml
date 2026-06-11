@@ -23,6 +23,7 @@ data:
   frame_stride: 2
   target_fps: 0.0
   auto_steps: 2
+  rollout_state_mode: measured_train
 
 model:
   type: official_lite
@@ -82,7 +83,7 @@ wandb:
     - mixed-servo
     - old-servo
     - frame-stride2
-  log_every: 20
+  log_every: 50
   watch_log: gradients
   watch_freq: 200
   grad_stats_every: 20

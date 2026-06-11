@@ -103,6 +103,7 @@ def main() -> None:
                     auto_steps=config.auto_steps,
                     state_columns=config.state_columns,
                     action_columns=config.action_columns,
+                    rollout_state_mode=config.rollout_state_mode,
                     label=f"eval {split}",
                     show_progress=not args.no_progress,
                 )

@@ -36,6 +36,7 @@ def build_train_args(cfg: Any) -> Namespace:
     args.frame_stride = int(data_cfg.get("frame_stride", args.frame_stride))
     args.target_fps = float(data_cfg.get("target_fps", args.target_fps))
     args.auto_steps = int(data_cfg.get("auto_steps", args.auto_steps))
+    args.rollout_state_mode = str(data_cfg.get("rollout_state_mode", args.rollout_state_mode))
 
     args.predictor_type = str(model_cfg.get("type", args.predictor_type))
     args.model_size = str(model_cfg.get("size", args.model_size))

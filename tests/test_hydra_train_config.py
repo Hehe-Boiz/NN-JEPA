@@ -19,6 +19,7 @@ class HydraTrainConfigTests(unittest.TestCase):
                     "raw_frames_per_sample": 8,
                     "sequence_stride": 1,
                     "auto_steps": 2,
+                    "rollout_state_mode": "measured_train",
                 },
                 "model": {
                     "type": "official_lite",
@@ -71,6 +72,7 @@ class HydraTrainConfigTests(unittest.TestCase):
         self.assertEqual(args.output_dir, Path("checkpoints/tiny"))
         self.assertTrue(args._output_dir_was_provided)
         self.assertEqual(args.state_columns, ["yaw_rate_t", "accel_x_t"])
+        self.assertEqual(args.rollout_state_mode, "measured_train")
         self.assertEqual(args.batch_size, 4)
         self.assertEqual(args.device, "cpu")
         self.assertFalse(args.skip_test)

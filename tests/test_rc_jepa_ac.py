@@ -17,10 +17,13 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 if TORCH_AVAILABLE:
     import torch
 
+    import models.rc_jepa_ac as rc_jepa_ac
     from data.normalization import FeatureNormalizer, FeatureStats
     from data.feature_sequence_dataset import RCJepaACFeatureSequenceDataset
     from data.sequence_dataset import RCJepaACSequenceDataset, build_sequence_windows
     from models.rc_jepa_ac import (
+        ROLLOUT_STATE_MODE_LEGACY_REPEAT,
+        ROLLOUT_STATE_MODE_MEASURED_TRAIN,
         SimpleACPredictor,
         VJepaStyleACPredictor,
         apply_predictor_size_preset,
@@ -121,6 +124,8 @@ class RCJepaACTests(unittest.TestCase):
                         "tokens_per_frame": 4,
                         "embed_dim": 8,
                         "dtype": "fp16",
+                        "image_path_key": "source_frame_path",
+                        "image_path_fallback": True,
                     }
                 ),
                 encoding="utf-8",
@@ -269,6 +274,7 @@ class RCJepaACTests(unittest.TestCase):
             vjepa_checkpoint=None,
             checkpoint_key=None,
             output_dir=None,
+            manifest_dir=settings.MANIFEST_DIR,
             dtype="fp32",
         )
 
@@ -368,6 +374,100 @@ class RCJepaACTests(unittest.TestCase):
         self.assertEqual(outputs["loss"].ndim, 0)
         self.assertEqual(outputs["teacher_forcing_loss"].ndim, 0)
         self.assertEqual(outputs["rollout_loss"].ndim, 0)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_measured_train_rollout_uses_measured_states_without_helper(self) -> None:
+        predictor = RecordingRolloutPredictor()
+        latents = torch.tensor([[[0.0], [10.0], [20.0], [30.0]]])
+        states = torch.tensor([[[0.0], [1.0], [2.0], [3.0]]])
+        actions = torch.tensor([[[10.0], [11.0], [12.0]]])
+
+        original_helper = rc_jepa_ac.build_rollout_state_context
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("measured_train rollout must not call build_rollout_state_context")
+
+        rc_jepa_ac.build_rollout_state_context = fail_if_called
+        try:
+            outputs = compute_world_model_losses(
+                predictor=predictor,
+                latents=latents,
+                states=states,
+                actions=actions,
+                tokens_per_frame=1,
+                auto_steps=2,
+                rollout_state_mode=ROLLOUT_STATE_MODE_MEASURED_TRAIN,
+            )
+        finally:
+            rc_jepa_ac.build_rollout_state_context = original_helper
+
+        self.assertEqual(outputs["loss"].ndim, 0)
+        self.assertEqual(len(predictor.calls), 3)
+        _, step0_state, step0_action = predictor.calls[1]
+        step1_latent, step1_state, step1_action = predictor.calls[2]
+        self.assertEqual(step0_state.flatten().tolist(), [0.0])
+        self.assertEqual(step0_action.flatten().tolist(), [10.0])
+        self.assertEqual(step1_state.flatten().tolist(), [0.0, 1.0])
+        self.assertEqual(step1_action.flatten().tolist(), [10.0, 11.0])
+        self.assertEqual(step1_latent.flatten().tolist(), [0.0, 102.0])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_legacy_repeat_rollout_keeps_old_state_context_behavior(self) -> None:
+        predictor = RecordingRolloutPredictor()
+        latents = torch.zeros(1, 3, 1)
+        states = torch.tensor([[[10.0, 20.0, 30.0, 0.1, 0.2], [11.0, 21.0, 31.0, 0.3, 0.4], [12.0, 22.0, 32.0, 0.5, 0.6]]])
+        actions = torch.tensor([[[0.7, 0.8], [0.9, 1.0]]])
+
+        compute_world_model_losses(
+            predictor=predictor,
+            latents=latents,
+            states=states,
+            actions=actions,
+            tokens_per_frame=1,
+            auto_steps=2,
+            state_columns=tuple(settings.AC_STATE_COLUMNS),
+            action_columns=tuple(settings.AC_ACTION_COLUMNS),
+            rollout_state_mode=ROLLOUT_STATE_MODE_LEGACY_REPEAT,
+        )
+
+        _, step1_state, _ = predictor.calls[2]
+        self.assertEqual(step1_state[0, 1, :3].tolist(), [10.0, 20.0, 30.0])
+        self.assertTrue(torch.allclose(step1_state[0, 1, 3:], torch.tensor([0.7, 0.8])))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_world_model_losses_backward_for_rollout_modes_and_steps(self) -> None:
+        for rollout_state_mode in (ROLLOUT_STATE_MODE_LEGACY_REPEAT, ROLLOUT_STATE_MODE_MEASURED_TRAIN):
+            for auto_steps in (1, 2, 4):
+                with self.subTest(rollout_state_mode=rollout_state_mode, auto_steps=auto_steps):
+                    predictor = SimpleACPredictor(
+                        latent_dim=8,
+                        state_dim=5,
+                        action_dim=2,
+                        tokens_per_frame=4,
+                        max_frames=5,
+                        predictor_dim=16,
+                        depth=1,
+                        num_heads=4,
+                    )
+                    latents = torch.randn(2, 5 * 4, 8)
+                    states = torch.randn(2, 5, 5)
+                    actions = torch.randn(2, 4, 2)
+
+                    outputs = compute_world_model_losses(
+                        predictor=predictor,
+                        latents=latents,
+                        states=states,
+                        actions=actions,
+                        tokens_per_frame=4,
+                        auto_steps=auto_steps,
+                        state_columns=tuple(settings.AC_STATE_COLUMNS),
+                        action_columns=tuple(settings.AC_ACTION_COLUMNS),
+                        rollout_state_mode=rollout_state_mode,
+                    )
+                    outputs["loss"].backward()
+
+                    first_grad = next(parameter.grad for parameter in predictor.parameters() if parameter.grad is not None)
+                    self.assertTrue(torch.isfinite(first_grad).all())
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_action_normalization_round_trip_for_planner(self) -> None:
@@ -507,6 +607,7 @@ class RCJepaACTests(unittest.TestCase):
                 "raw_frames_per_sample": 6,
                 "sequence_stride": 2,
                 "auto_steps": 3,
+                "rollout_state_mode": "measured_train",
                 "predictor_type": "official_lite",
                 "predictor_dim": 32,
                 "predictor_depth": 2,
@@ -527,6 +628,7 @@ class RCJepaACTests(unittest.TestCase):
         self.assertEqual(config.raw_frames_per_sample, 6)
         self.assertEqual(config.sequence_stride, 2)
         self.assertEqual(config.auto_steps, 3)
+        self.assertEqual(config.rollout_state_mode, "measured_train")
         self.assertEqual(config.predictor_type, "official_lite")
         self.assertEqual(config.predictor_dim, 32)
         self.assertEqual(config.predictor_depth, 2)
@@ -716,6 +818,30 @@ class ToyPlannerPredictor(torch.nn.Module if TORCH_AVAILABLE else object):
         latent = latent_tokens.view(batch_size, num_frames, tokens_per_frame, latent_dim)
         action_delta = actions.sum(dim=-1).view(batch_size, num_frames, 1, 1)
         return (latent + action_delta).reshape(batch_size, total_tokens, latent_dim)
+
+
+class RecordingRolloutPredictor(torch.nn.Module if TORCH_AVAILABLE else object):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def forward(
+        self,
+        latent_tokens: torch.Tensor,
+        actions: torch.Tensor,
+        states: torch.Tensor,
+        tokens_per_frame: int | None = None,
+    ) -> torch.Tensor:
+        self.calls.append(
+            (
+                latent_tokens.detach().cpu().clone(),
+                states.detach().cpu().clone(),
+                actions.detach().cpu().clone(),
+            )
+        )
+        value = 100.0 + float(len(self.calls))
+        return torch.ones_like(latent_tokens) * self.scale * value
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import sys
 import math
 from pathlib import Path
 from typing import Any
+import warnings
 
 import torch
 from torch import nn
@@ -27,6 +28,14 @@ DEFAULT_PREDICTOR_HEADS = 8
 DEFAULT_PATCH_SIZE = 16
 DEFAULT_PREDICTOR_TYPE = "simple"
 SUPPORTED_PREDICTOR_TYPES = ("simple", "official_lite")
+ROLLOUT_STATE_MODE_LEGACY_REPEAT = "legacy_repeat"
+ROLLOUT_STATE_MODE_MEASURED_TRAIN = "measured_train"
+DEFAULT_ROLLOUT_STATE_MODE = ROLLOUT_STATE_MODE_MEASURED_TRAIN
+SUPPORTED_ROLLOUT_STATE_MODES = (
+    ROLLOUT_STATE_MODE_LEGACY_REPEAT,
+    ROLLOUT_STATE_MODE_MEASURED_TRAIN,
+)
+DYNAMIC_STATE_COLUMNS = ("v_t", "yaw_rate_t", "accel_x_t", "accel_y_t")
 PREDICTOR_SIZE_PRESETS = {
     "tiny": {
         "predictor_dim": 128,
@@ -759,14 +768,17 @@ class RCJepaACWorldModel(nn.Module):
         predictor_type: str = DEFAULT_PREDICTOR_TYPE,
         dropout: float = 0.0,
         auto_steps: int = settings.AC_AUTO_STEPS,
+        rollout_state_mode: str = DEFAULT_ROLLOUT_STATE_MODE,
         strict_checkpoint: bool = True,
     ) -> None:
         super().__init__()
+        validate_rollout_state_mode(rollout_state_mode)
         self.raw_frames_per_sample = raw_frames_per_sample
         self.auto_steps = auto_steps
         self.state_columns = tuple(state_columns)
         self.action_columns = tuple(action_columns)
         self.predictor_type = predictor_type
+        self.rollout_state_mode = rollout_state_mode
         self.target_encoder = FrozenVJepa21Encoder(
             vjepa_root=vjepa_root,
             checkpoint_path=checkpoint_path,
@@ -811,6 +823,7 @@ class RCJepaACWorldModel(nn.Module):
             auto_steps=self.auto_steps,
             state_columns=self.state_columns,
             action_columns=self.action_columns,
+            rollout_state_mode=self.rollout_state_mode,
         )
 
 
@@ -823,11 +836,15 @@ def compute_world_model_losses(
     auto_steps: int,
     state_columns: tuple[str, ...] | None = None,
     action_columns: tuple[str, ...] | None = None,
+    rollout_state_mode: str = DEFAULT_ROLLOUT_STATE_MODE,
 ) -> dict[str, torch.Tensor]:
     if auto_steps < 1:
         raise ValueError("auto_steps must be >= 1")
+    validate_rollout_state_mode(rollout_state_mode)
 
+    batch_size = states.size(0)
     num_frames = states.size(1)
+    latent_dim = latents.size(-1)
     if num_frames < 2:
         raise ValueError("Need at least 2 frames to train next-frame dynamics")
     if actions.size(1) != num_frames - 1:
@@ -845,19 +862,34 @@ def compute_world_model_losses(
 
     rollout_steps = min(auto_steps, num_frames - 1)
     rollout_tokens = latents[:, :tokens_per_frame]
-    rollout_states = build_rollout_state_context(
-        initial_state=states[:, :1],
-        actions=actions,
-        rollout_steps=rollout_steps,
-        state_columns=state_columns,
-        action_columns=action_columns,
-    )
+    if rollout_state_mode == ROLLOUT_STATE_MODE_MEASURED_TRAIN:
+        rollout_states = states[:, :rollout_steps]
+    else:
+        rollout_states = build_rollout_state_context(
+            initial_state=states[:, :1],
+            actions=actions,
+            rollout_steps=rollout_steps,
+            state_columns=state_columns,
+            action_columns=action_columns,
+        )
     rollout_predictions = []
     for step in range(rollout_steps):
+        expected_context_frames = step + 1
+        action_context = actions[:, :expected_context_frames]
+        state_context = rollout_states[:, :expected_context_frames]
+        assert_rollout_context_shapes(
+            latent_context=rollout_tokens,
+            state_context=state_context,
+            action_context=action_context,
+            batch_size=batch_size,
+            context_frames=expected_context_frames,
+            tokens_per_frame=tokens_per_frame,
+            latent_dim=latent_dim,
+        )
         pred_tokens = predictor(
             latent_tokens=rollout_tokens,
-            actions=actions[:, : step + 1],
-            states=rollout_states[:, : step + 1],
+            actions=action_context,
+            states=state_context,
             tokens_per_frame=tokens_per_frame,
         )
         next_tokens = pred_tokens[:, -tokens_per_frame:]
@@ -883,7 +915,15 @@ def build_rollout_state_context(
     state_columns: tuple[str, ...] | None = None,
     action_columns: tuple[str, ...] | None = None,
 ) -> torch.Tensor:
-    """Build rollout state inputs without using future measured state."""
+    """Fallback rollout state approximation for inference/planning.
+
+    This helper repeats the initial state and only copies previous action into
+    steering_last_t/throttle_last_t. It is intended for inference/planning when
+    measured future states are unavailable, or for explicit legacy training
+    compatibility. Training rollout should use measured future states via
+    rollout_state_mode="measured_train" when they exist.
+    """
+    warn_if_dynamic_states_are_stale(state_columns)
     rollout_states = initial_state.repeat(1, rollout_steps, 1)
     if rollout_steps <= 1 or state_columns is None or action_columns is None:
         return rollout_states
@@ -921,6 +961,54 @@ def copy_previous_action_to_state(
     action_index = action_columns.index(action_name)
     for step in range(1, rollout_states.size(1)):
         rollout_states[:, step, state_index] = actions[:, step - 1, action_index]
+
+
+def validate_rollout_state_mode(mode: str) -> None:
+    if mode not in SUPPORTED_ROLLOUT_STATE_MODES:
+        available = ", ".join(SUPPORTED_ROLLOUT_STATE_MODES)
+        raise ValueError(f"Unknown rollout_state_mode={mode!r}. Available: {available}")
+
+
+def assert_rollout_context_shapes(
+    latent_context: torch.Tensor,
+    state_context: torch.Tensor,
+    action_context: torch.Tensor,
+    batch_size: int,
+    context_frames: int,
+    tokens_per_frame: int,
+    latent_dim: int,
+) -> None:
+    expected_latent_shape = (batch_size, context_frames * tokens_per_frame, latent_dim)
+    if tuple(latent_context.shape) != expected_latent_shape:
+        raise RuntimeError(
+            "Invalid autoregressive latent context shape: "
+            f"expected {expected_latent_shape}, got {tuple(latent_context.shape)}"
+        )
+    if state_context.shape[:2] != (batch_size, context_frames):
+        raise RuntimeError(
+            "Invalid rollout state context shape: "
+            f"expected first dims {(batch_size, context_frames)}, got {tuple(state_context.shape)}"
+        )
+    if action_context.shape[:2] != (batch_size, context_frames):
+        raise RuntimeError(
+            "Invalid rollout action context shape: "
+            f"expected first dims {(batch_size, context_frames)}, got {tuple(action_context.shape)}"
+        )
+
+
+def warn_if_dynamic_states_are_stale(state_columns: tuple[str, ...] | None) -> None:
+    if not state_columns:
+        return
+    stale_columns = [column for column in DYNAMIC_STATE_COLUMNS if column in state_columns]
+    if not stale_columns:
+        return
+    warnings.warn(
+        "build_rollout_state_context is using stale/approximated dynamic state columns "
+        f"{stale_columns}. This is only a fallback for inference/planning or explicit "
+        "legacy_repeat training; measured_train rollout should use measured states.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def build_time_causal_mask(num_frames: int, tokens_per_step: int, device: torch.device) -> torch.Tensor:

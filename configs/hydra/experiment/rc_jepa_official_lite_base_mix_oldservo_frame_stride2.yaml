@@ -29,6 +29,7 @@ data:
   frame_stride: 2
   target_fps: 0.0
   auto_steps: 2
+  rollout_state_mode: measured_train
 
 model:
   type: official_lite
@@ -40,8 +41,8 @@ model:
 
 train:
   epochs: 100
-  batch_size: 2
-  eval_batch_size: 1
+  batch_size: 20
+  eval_batch_size: 4
   num_workers: 4
   train_sampler: session
   eval_sampler: session
@@ -89,7 +90,7 @@ wandb:
     - old-servo
     - frame-stride2
     - strongest
-  log_every: 20
+  log_every: 50
   watch_log: gradients
   watch_freq: 200
   grad_stats_every: 20

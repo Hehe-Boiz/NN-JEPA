@@ -26,7 +26,10 @@ from data.normalization import normalizer_to_dict
 from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS
 from models.rc_jepa_ac import (
     DEFAULT_PREDICTOR_TYPE,
+    DEFAULT_ROLLOUT_STATE_MODE,
     PREDICTOR_SIZE_PRESETS,
+    ROLLOUT_STATE_MODE_LEGACY_REPEAT,
+    SUPPORTED_ROLLOUT_STATE_MODES,
     SUPPORTED_PREDICTOR_TYPES,
     apply_predictor_size_preset,
     build_ac_predictor,
@@ -85,6 +88,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=settings.AC_FRAME_STRIDE)
     parser.add_argument("--target-fps", type=float, default=settings.AC_TARGET_FPS)
     parser.add_argument("--auto-steps", type=int, default=settings.AC_AUTO_STEPS)
+    parser.add_argument(
+        "--rollout-state-mode",
+        choices=SUPPORTED_ROLLOUT_STATE_MODES,
+        default=DEFAULT_ROLLOUT_STATE_MODE,
+        help=(
+            "State conditioning used during training rollout. measured_train uses measured "
+            "states[:, :k+1]; legacy_repeat repeats state_0 and only copies previous action."
+        ),
+    )
     parser.add_argument("--predictor-type", choices=SUPPORTED_PREDICTOR_TYPES, default=DEFAULT_PREDICTOR_TYPE)
     parser.add_argument("--model-size", choices=tuple(PREDICTOR_SIZE_PRESETS), default="base")
     parser.add_argument("--predictor-dim", type=int, default=None)
@@ -252,6 +264,7 @@ def run_epoch(
     auto_steps: int,
     state_columns: tuple[str, ...],
     action_columns: tuple[str, ...],
+    rollout_state_mode: str,
     label: str,
     show_progress: bool,
     wandb_run: Any | None = None,
@@ -310,6 +323,7 @@ def run_epoch(
                 auto_steps=auto_steps,
                 state_columns=state_columns,
                 action_columns=action_columns,
+                rollout_state_mode=rollout_state_mode,
             )
             loss = outputs["loss"]
             if not training and "data_domain" in batch:
@@ -331,6 +345,7 @@ def run_epoch(
                             auto_steps=auto_steps,
                             state_columns=state_columns,
                             action_columns=action_columns,
+                            rollout_state_mode=rollout_state_mode,
                         )
                     domain_totals.setdefault(
                         domain,
@@ -375,7 +390,10 @@ def run_epoch(
                 if current_lr is not None:
                     batch_metrics["lr"] = current_lr
                 batch_metrics.update(extra_batch_metrics)
-                log_metrics(wandb_run, flatten_metrics(wandb_prefix, batch_metrics), step=global_step)
+                wandb_metrics = flatten_metrics(wandb_prefix, batch_metrics)
+                if wandb_prefix == "train_batch":
+                    wandb_metrics.update(jepa_style_train_batch_metrics(batch_metrics))
+                log_metrics(wandb_run, wandb_metrics, step=global_step)
 
     metrics = average_metrics(totals, total_samples)
     for domain, totals_by_key in domain_totals.items():
@@ -677,6 +695,54 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def jepa_style_train_batch_metrics(batch_metrics: dict[str, float]) -> dict[str, float]:
+    """Match JEPA train_ac_car W&B batch metric names."""
+    metrics = {
+        "train/loss": float(batch_metrics["loss"]),
+        "train/tf": float(batch_metrics["teacher_forcing_loss"]),
+        "train/rollout": float(batch_metrics["rollout_loss"]),
+    }
+    if "lr" in batch_metrics:
+        metrics["train/lr"] = float(batch_metrics["lr"])
+    return metrics
+
+
+def jepa_style_train_epoch_metrics(train_metrics: dict[str, float]) -> dict[str, float]:
+    """Aggregate train metrics without colliding with JEPA batch keys."""
+    return {
+        "train_epoch/loss": float(train_metrics["loss"]),
+        "train_epoch/tf": float(train_metrics["teacher_forcing_loss"]),
+        "train_epoch/rollout": float(train_metrics["rollout_loss"]),
+        "train_epoch/teacher_forcing_loss": float(train_metrics["teacher_forcing_loss"]),
+        "train_epoch/rollout_loss": float(train_metrics["rollout_loss"]),
+    }
+
+
+def jepa_style_val_epoch_metrics(val_metrics: dict[str, float]) -> dict[str, float]:
+    """JEPA-compatible validation aliases plus NN-JEPA detailed val metrics."""
+    metrics = {
+        "val/loss": float(val_metrics["loss"]),
+        "val/tf": float(val_metrics["teacher_forcing_loss"]),
+        "val/rollout": float(val_metrics["rollout_loss"]),
+    }
+    metrics.update(flatten_metrics("val", val_metrics))
+    return metrics
+
+
+def jepa_style_final_summary(best_val_loss: float, final_eval_metrics: dict[str, float]) -> dict[str, float]:
+    """Summary keys used by JEPA, extended to horizon 3 when available."""
+    metrics: dict[str, float] = {"final/best_val": float(best_val_loss)}
+    if "rollout_l1_h1" in final_eval_metrics:
+        metrics["final/rollout1"] = float(final_eval_metrics["rollout_l1_h1"])
+    if "ratio_h1" in final_eval_metrics:
+        metrics["final/rollout1_ratio"] = float(final_eval_metrics["ratio_h1"])
+    if "rollout_l1_h3" in final_eval_metrics:
+        metrics["final/rollout3"] = float(final_eval_metrics["rollout_l1_h3"])
+    if "ratio_h3" in final_eval_metrics:
+        metrics["final/rollout3_ratio"] = float(final_eval_metrics["ratio_h3"])
+    return metrics
+
+
 def epoch_wandb_metrics(
     epoch: int,
     train_metrics: dict[str, float],
@@ -692,8 +758,8 @@ def epoch_wandb_metrics(
         "best/val_loss": best_val_loss,
         "best/epoch": float(best_epoch),
         "early_stop/patience": float(epochs_without_improvement),
-        **flatten_metrics("train", train_metrics),
-        **flatten_metrics("val", val_metrics),
+        **jepa_style_train_epoch_metrics(train_metrics),
+        **jepa_style_val_epoch_metrics(val_metrics),
     }
 
 
@@ -757,6 +823,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "frame_stride": settings.AC_FRAME_STRIDE,
         "target_fps": settings.AC_TARGET_FPS,
         "auto_steps": settings.AC_AUTO_STEPS,
+        "rollout_state_mode": ROLLOUT_STATE_MODE_LEGACY_REPEAT,
     }
     checked_fields = (
         "predictor_type",
@@ -764,6 +831,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "frame_stride",
         "target_fps",
         "auto_steps",
+        "rollout_state_mode",
         "predictor_dim",
         "predictor_depth",
         "predictor_heads",
@@ -935,6 +1003,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     auto_steps=args.auto_steps,
                     state_columns=tuple(args.state_columns),
                     action_columns=tuple(args.action_columns),
+                    rollout_state_mode=args.rollout_state_mode,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} train",
                     show_progress=not args.no_progress,
                     wandb_run=wandb_run,
@@ -978,6 +1047,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     auto_steps=args.auto_steps,
                     state_columns=tuple(args.state_columns),
                     action_columns=tuple(args.action_columns),
+                    rollout_state_mode=args.rollout_state_mode,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val",
                     show_progress=not args.no_progress,
                     amp_dtype=args.amp_dtype,
@@ -1153,6 +1223,22 @@ def main(args: argparse.Namespace | None = None) -> None:
                 wandb_run,
                 {f"final_eval_val/{key}": value for key, value in final_eval_metrics.items()},
             )
+            jepa_final_metrics = jepa_style_final_summary(best_val_loss, final_eval_metrics)
+            result["final"] = jepa_final_metrics
+            log_metrics(wandb_run, jepa_final_metrics, step=max(global_step, 1))
+            update_summary(wandb_run, jepa_final_metrics)
+            if "final/rollout1" in jepa_final_metrics:
+                rollout_line = (
+                    f"[final] best_val={best_val_loss:.5f} "
+                    f"rollout@1={jepa_final_metrics['final/rollout1']:.5f} "
+                    f"(x identity {jepa_final_metrics.get('final/rollout1_ratio', float('nan')):.3f})"
+                )
+                if "final/rollout3" in jepa_final_metrics:
+                    rollout_line += (
+                        f" rollout@3={jepa_final_metrics['final/rollout3']:.5f} "
+                        f"(x identity {jepa_final_metrics.get('final/rollout3_ratio', float('nan')):.3f})"
+                    )
+                print(rollout_line, flush=True)
         if args.final_planning_eval_samples > 0:
             maybe_cleanup_cuda()
             planning_horizon = resolve_positive_horizon(
@@ -1224,6 +1310,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 auto_steps=args.auto_steps,
                 state_columns=tuple(args.state_columns),
                 action_columns=tuple(args.action_columns),
+                rollout_state_mode=args.rollout_state_mode,
                 label="test",
                 show_progress=not args.no_progress,
                 amp_dtype=args.amp_dtype,

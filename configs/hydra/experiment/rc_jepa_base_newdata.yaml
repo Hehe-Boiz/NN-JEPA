@@ -23,6 +23,7 @@ data:
   frame_stride: 1
   target_fps: 0.0
   auto_steps: 2
+  rollout_state_mode: measured_train
 
 model:
   type: simple
@@ -64,7 +65,7 @@ wandb:
     - hydra
     - new-data
     - simple
-  log_every: 20
+  log_every: 50
   watch_log: all
   watch_freq: 100
   grad_stats_every: 10

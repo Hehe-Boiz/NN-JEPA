@@ -15,6 +15,7 @@ from models.rc_jepa_ac import (
     DEFAULT_PREDICTOR_DEPTH,
     DEFAULT_PREDICTOR_DIM,
     DEFAULT_PREDICTOR_HEADS,
+    ROLLOUT_STATE_MODE_LEGACY_REPEAT,
     build_ac_predictor,
 )
 
@@ -31,6 +32,7 @@ class FeaturePredictorConfig:
     frame_stride: int
     target_fps: float
     auto_steps: int
+    rollout_state_mode: str
     predictor_type: str
     predictor_dim: int
     predictor_depth: int
@@ -101,6 +103,7 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> FeaturePredictorConfig
         frame_stride=int(checkpoint_args.get("frame_stride", settings.AC_FRAME_STRIDE)),
         target_fps=float(checkpoint_args.get("target_fps", settings.AC_TARGET_FPS)),
         auto_steps=int(checkpoint_args.get("auto_steps", settings.AC_AUTO_STEPS)),
+        rollout_state_mode=str(checkpoint_args.get("rollout_state_mode", ROLLOUT_STATE_MODE_LEGACY_REPEAT)),
         predictor_type=str(checkpoint_args.get("predictor_type", DEFAULT_PREDICTOR_TYPE)),
         predictor_dim=int(checkpoint_args.get("predictor_dim", DEFAULT_PREDICTOR_DIM)),
         predictor_depth=int(checkpoint_args.get("predictor_depth", DEFAULT_PREDICTOR_DEPTH)),

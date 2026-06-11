@@ -24,8 +24,11 @@ from models.rc_jepa_ac import (
     DEFAULT_ENCODER_NAME,
     DEFAULT_PATCH_SIZE,
     DEFAULT_PREDICTOR_TYPE,
+    DEFAULT_ROLLOUT_STATE_MODE,
     PREDICTOR_SIZE_PRESETS,
     RCJepaACWorldModel,
+    ROLLOUT_STATE_MODE_LEGACY_REPEAT,
+    SUPPORTED_ROLLOUT_STATE_MODES,
     SUPPORTED_PREDICTOR_TYPES,
     apply_predictor_size_preset,
     count_trainable_parameters,
@@ -77,6 +80,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--tubelet-size", type=int, default=settings.AC_TUBELET_SIZE)
     parser.add_argument("--auto-steps", type=int, default=settings.AC_AUTO_STEPS)
+    parser.add_argument(
+        "--rollout-state-mode",
+        choices=SUPPORTED_ROLLOUT_STATE_MODES,
+        default=DEFAULT_ROLLOUT_STATE_MODE,
+        help=(
+            "State conditioning used during training rollout. measured_train uses measured "
+            "states[:, :k+1]; legacy_repeat repeats state_0 and only copies previous action."
+        ),
+    )
     parser.add_argument("--predictor-type", choices=SUPPORTED_PREDICTOR_TYPES, default=DEFAULT_PREDICTOR_TYPE)
     parser.add_argument("--model-size", choices=tuple(PREDICTOR_SIZE_PRESETS), default="base")
     parser.add_argument("--predictor-dim", type=int, default=None)
@@ -140,6 +152,7 @@ def build_model(args: argparse.Namespace) -> RCJepaACWorldModel:
         predictor_type=args.predictor_type,
         dropout=args.dropout,
         auto_steps=args.auto_steps,
+        rollout_state_mode=args.rollout_state_mode,
         strict_checkpoint=not args.allow_partial_checkpoint,
     )
 
@@ -427,6 +440,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "frame_stride": settings.AC_FRAME_STRIDE,
         "target_fps": settings.AC_TARGET_FPS,
         "auto_steps": settings.AC_AUTO_STEPS,
+        "rollout_state_mode": ROLLOUT_STATE_MODE_LEGACY_REPEAT,
     }
     checked_fields = (
         "predictor_type",
@@ -434,6 +448,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "frame_stride",
         "target_fps",
         "auto_steps",
+        "rollout_state_mode",
         "predictor_dim",
         "predictor_depth",
         "predictor_heads",
