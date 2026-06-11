@@ -7,8 +7,9 @@ from contextlib import nullcontext
 import json
 import random
 import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,7 @@ from data.normalization import normalizer_to_dict
 from data.sequence_dataset import DEFAULT_AC_ACTION_COLUMNS, DEFAULT_AC_STATE_COLUMNS
 from models.rc_jepa_ac import (
     DEFAULT_PREDICTOR_TYPE,
+    DEFAULT_ROLLOUT_FEEDBACK_NORM,
     DEFAULT_ROLLOUT_STATE_MODE,
     PREDICTOR_SIZE_PRESETS,
     ROLLOUT_STATE_MODE_LEGACY_REPEAT,
@@ -36,6 +38,7 @@ from models.rc_jepa_ac import (
     build_rollout_state_context,
     compute_world_model_losses,
     count_trainable_parameters,
+    normalize_rollout_feedback,
 )
 from tools.train_rc_jepa_ac import (
     DEFAULT_BATCH_SIZE,
@@ -58,6 +61,7 @@ from tools.train_rc_jepa_ac import (
 from tools.rc_jepa_ac_cem_planner import (
     RCJepaACFeatureCEMPlanner,
     denormalize_action_tensor,
+    make_zero_control_actions,
 )
 from tools.wandb_utils import (
     add_wandb_args,
@@ -74,6 +78,13 @@ from tools.wandb_utils import (
 
 DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp16"
 DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_vitb_features_20260607")
+DEFAULT_SAVE_EVERY_STEPS = 0
+DEFAULT_SAVE_EVERY_MINUTES = 20.0
+DEFAULT_KEEP_STEP_CHECKPOINTS = 1
+RECOVERY_CHECKPOINT_NAME = "recovery_step.pt"
+PHASE_EPOCH_COMPLETE = "epoch_complete"
+PHASE_TRAIN_COMPLETE_WAITING_VAL = "train_complete_waiting_val"
+PHASE_TRAIN_IN_PROGRESS = "train_in_progress"
 ROLLOUT_EVAL_STATE_MODE_MEASURED = "measured"
 ROLLOUT_EVAL_STATE_MODE_FALLBACK = "fallback"
 ROLLOUT_EVAL_STATE_MODE_BOTH = "both"
@@ -116,6 +127,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "both logs both side by side."
         ),
     )
+    parser.add_argument(
+        "--rollout-feedback-norm",
+        action="store_true",
+        default=DEFAULT_ROLLOUT_FEEDBACK_NORM,
+        help="LayerNorm each predicted latent frame before feeding it back during autoregressive rollout.",
+    )
     parser.add_argument("--predictor-type", choices=SUPPORTED_PREDICTOR_TYPES, default=DEFAULT_PREDICTOR_TYPE)
     parser.add_argument("--model-size", choices=tuple(PREDICTOR_SIZE_PRESETS), default="base")
     parser.add_argument("--predictor-dim", type=int, default=None)
@@ -150,6 +167,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["fp32", "bf16"],
         default="fp32",
         help="Forward/loss autocast dtype. bf16 matches V-JEPA AC style on CUDA; fp32 disables autocast.",
+    )
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=DEFAULT_SAVE_EVERY_STEPS,
+        help="Save recovery_step.pt every N optimizer steps during train epoch. 0 disables step-based saves.",
+    )
+    parser.add_argument(
+        "--save-every-minutes",
+        type=float,
+        default=DEFAULT_SAVE_EVERY_MINUTES,
+        help="Save recovery_step.pt every N minutes during train epoch. 0 disables time-based saves.",
+    )
+    parser.add_argument(
+        "--keep-step-checkpoints",
+        type=int,
+        default=DEFAULT_KEEP_STEP_CHECKPOINTS,
+        help="Number of timestamped recovery snapshots to keep in output_dir/recovery. 1 keeps only recovery_step.pt.",
     )
     parser.add_argument(
         "--final-eval-horizon",
@@ -284,6 +319,7 @@ def run_epoch(
     state_columns: tuple[str, ...],
     action_columns: tuple[str, ...],
     rollout_state_mode: str,
+    rollout_feedback_norm: bool,
     label: str,
     show_progress: bool,
     wandb_run: Any | None = None,
@@ -294,6 +330,10 @@ def run_epoch(
     wandb_grad_stats_every: int = 0,
     wandb_param_stats_every: int = 0,
     amp_dtype: str = "fp32",
+    skip_batches: int = 0,
+    initial_totals: dict[str, float] | None = None,
+    initial_total_samples: int = 0,
+    checkpoint_callback: Callable[[int, int, dict[str, float], dict[str, float], int], None] | None = None,
 ) -> tuple[dict[str, float], int]:
     training = optimizer is not None
     predictor.train(training)
@@ -302,13 +342,20 @@ def run_epoch(
         "teacher_forcing_loss": 0.0,
         "rollout_loss": 0.0,
     }
+    if initial_totals is not None:
+        for key in totals:
+            totals[key] = float(initial_totals.get(key, 0.0))
     domain_totals: dict[str, dict[str, float]] = {}
     domain_counts: dict[str, int] = {}
-    total_samples = 0
+    total_samples = int(initial_total_samples)
     global_step = global_step_start
     progress = tqdm(dataloader, desc=label, leave=False, disable=not show_progress)
 
     for step, batch in enumerate(progress, start=1):
+        if skip_batches > 0 and step <= skip_batches:
+            if step == skip_batches:
+                progress.set_postfix({"skipped_batches": skip_batches})
+            continue
         should_log_batch = (
             training
             and wandb_run is not None
@@ -343,6 +390,7 @@ def run_epoch(
                 state_columns=state_columns,
                 action_columns=action_columns,
                 rollout_state_mode=rollout_state_mode,
+                rollout_feedback_norm=rollout_feedback_norm,
             )
             loss = outputs["loss"]
             if not training and "data_domain" in batch:
@@ -365,6 +413,7 @@ def run_epoch(
                             state_columns=state_columns,
                             action_columns=action_columns,
                             rollout_state_mode=rollout_state_mode,
+                            rollout_feedback_norm=rollout_feedback_norm,
                         )
                     domain_totals.setdefault(
                         domain,
@@ -413,6 +462,14 @@ def run_epoch(
                 if wandb_prefix == "train_batch":
                     wandb_metrics.update(jepa_style_train_batch_metrics(batch_metrics))
                 log_metrics(wandb_run, wandb_metrics, step=global_step)
+            if checkpoint_callback is not None:
+                checkpoint_callback(
+                    step,
+                    global_step,
+                    average_metrics(totals, total_samples),
+                    dict(totals),
+                    total_samples,
+                )
 
     metrics = average_metrics(totals, total_samples)
     for domain, totals_by_key in domain_totals.items():
@@ -504,6 +561,7 @@ def final_rollout_identity_eval(
     max_batches: int = 0,
     label: str = "final val rollout",
     rollout_eval_state_mode: str = DEFAULT_ROLLOUT_EVAL_STATE_MODE,
+    rollout_feedback_norm: bool = DEFAULT_ROLLOUT_FEEDBACK_NORM,
 ) -> dict[str, float]:
     """Compare autoregressive rollout against an identity latent baseline on val."""
     if horizon < 1:
@@ -553,7 +611,8 @@ def final_rollout_identity_eval(
                     )
                 next_tokens = pred_tokens[:, -tokens_per_frame:]
                 predictions.append(next_tokens)
-                rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+                feedback_tokens = normalize_rollout_feedback(next_tokens, enabled=rollout_feedback_norm)
+                rollout_tokens = torch.cat([rollout_tokens, feedback_tokens], dim=1)
 
             model_totals = model_totals_by_mode[mode]
             identity_totals = identity_totals_by_mode[mode]
@@ -598,10 +657,12 @@ def action_bounds_for_columns(action_columns: tuple[str, ...]) -> tuple[list[flo
     low_by_column = {
         "steering_cmd_t": settings.STEERING_MIN,
         "throttle_cmd_t": settings.THROTTLE_MIN,
+        "domain_id": 0.0,
     }
     high_by_column = {
         "steering_cmd_t": settings.STEERING_MAX,
         "throttle_cmd_t": settings.THROTTLE_MAX,
+        "domain_id": 1.0,
     }
     return (
         [float(low_by_column.get(column, -1.0)) for column in action_columns],
@@ -635,6 +696,7 @@ def final_planning_eval(
     action_penalty: float,
     smooth_penalty: float,
     show_progress: bool,
+    rollout_feedback_norm: bool = DEFAULT_ROLLOUT_FEEDBACK_NORM,
 ) -> dict[str, float]:
     """Run a small offline CEM planning eval on val using fallback rollout states."""
     if max_samples < 1:
@@ -676,6 +738,7 @@ def final_planning_eval(
         action_penalty=action_penalty,
         smooth_penalty=smooth_penalty,
         device=device,
+        rollout_feedback_norm=rollout_feedback_norm,
     )
 
     total_planned_l1 = 0.0
@@ -703,19 +766,23 @@ def final_planning_eval(
             goal_end = goal_start + tokens_per_frame
             goal_tokens = latents[row, goal_start:goal_end]
             initial_state = states[row, 0]
-            plan = planner.plan(
-                context_tokens=context_tokens,
-                initial_state=initial_state,
-                goal_tokens=goal_tokens,
-            )
-
-            planned_actions = plan.action_sequence.to(device).unsqueeze(0)
             groundtruth_actions = denormalize_action_tensor(
                 model_actions[row : row + 1, :horizon],
                 action_columns=action_columns,
                 action_normalizer=action_normalizer,
             )
-            zero_actions = torch.zeros_like(planned_actions)
+            plan = planner.plan(
+                context_tokens=context_tokens,
+                initial_state=initial_state,
+                goal_tokens=goal_tokens,
+                reference_actions=groundtruth_actions[0],
+            )
+
+            planned_actions = plan.action_sequence.to(device).unsqueeze(0)
+            zero_actions = make_zero_control_actions(
+                groundtruth_actions,
+                action_columns=action_columns,
+            )
             goal_batched = goal_tokens.unsqueeze(0)
 
             planned_predictions = planner.rollout(context_tokens, initial_state, planned_actions)
@@ -880,7 +947,11 @@ def save_checkpoint(
     global_step: int,
     epochs_without_improvement: int,
     history: list[dict[str, Any]],
-    phase: str = "epoch_complete",
+    phase: str = PHASE_EPOCH_COMPLETE,
+    step_in_epoch: int | None = None,
+    steps_per_epoch_value: int | None = None,
+    train_totals: dict[str, float] | None = None,
+    train_total_samples: int | None = None,
 ) -> None:
     payload = {
         "epoch": epoch,
@@ -901,7 +972,19 @@ def save_checkpoint(
         "history": history,
         "note": "Trained from precomputed V-JEPA features. Encoder weights are not saved.",
     }
-    torch.save(payload, path)
+    if step_in_epoch is not None:
+        payload["step_in_epoch"] = int(step_in_epoch)
+    if steps_per_epoch_value is not None:
+        payload["steps_per_epoch"] = int(steps_per_epoch_value)
+    if train_totals is not None:
+        payload["train_totals"] = {key: float(value) for key, value in train_totals.items()}
+    if train_total_samples is not None:
+        payload["train_total_samples"] = int(train_total_samples)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
 
 
 def load_resume_checkpoint(
@@ -918,6 +1001,234 @@ def load_resume_checkpoint(
     return checkpoint
 
 
+def save_recovery_checkpoint(
+    predictor: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: LambdaLR | None,
+    epoch: int,
+    step_in_epoch: int,
+    steps_per_epoch_value: int,
+    args: argparse.Namespace,
+    train_metrics: dict[str, float],
+    train_totals: dict[str, float],
+    train_total_samples: int,
+    train_dataset_size: int | None,
+    normalization: dict[str, Any],
+    feature_metadata: dict[str, Any],
+    best_val_loss: float,
+    best_epoch: int,
+    global_step: int,
+    epochs_without_improvement: int,
+    history: list[dict[str, Any]],
+) -> None:
+    metrics = {
+        "epoch": epoch,
+        "train_partial": train_metrics,
+        "step_in_epoch": step_in_epoch,
+        "steps_per_epoch": steps_per_epoch_value,
+        "global_step": global_step,
+    }
+    if train_dataset_size is not None:
+        metrics["train_dataset_size"] = int(train_dataset_size)
+    latest_path = args.output_dir / RECOVERY_CHECKPOINT_NAME
+    save_checkpoint(
+        latest_path,
+        predictor,
+        optimizer,
+        lr_scheduler,
+        epoch,
+        args,
+        metrics,
+        normalization,
+        feature_metadata,
+        best_val_loss,
+        best_epoch,
+        global_step,
+        epochs_without_improvement,
+        history,
+        phase=PHASE_TRAIN_IN_PROGRESS,
+        step_in_epoch=step_in_epoch,
+        steps_per_epoch_value=steps_per_epoch_value,
+        train_totals=train_totals,
+        train_total_samples=train_total_samples,
+    )
+
+    keep = max(int(args.keep_step_checkpoints), 1)
+    if keep <= 1:
+        return
+    recovery_dir = args.output_dir / "recovery"
+    snapshot_path = recovery_dir / (
+        f"step_epoch_{epoch:03d}_batch_{step_in_epoch:06d}_global_{global_step:09d}.pt"
+    )
+    save_checkpoint(
+        snapshot_path,
+        predictor,
+        optimizer,
+        lr_scheduler,
+        epoch,
+        args,
+        metrics,
+        normalization,
+        feature_metadata,
+        best_val_loss,
+        best_epoch,
+        global_step,
+        epochs_without_improvement,
+        history,
+        phase=PHASE_TRAIN_IN_PROGRESS,
+        step_in_epoch=step_in_epoch,
+        steps_per_epoch_value=steps_per_epoch_value,
+        train_totals=train_totals,
+        train_total_samples=train_total_samples,
+    )
+    prune_recovery_snapshots(recovery_dir, keep=keep)
+
+
+def prune_recovery_snapshots(recovery_dir: Path, keep: int) -> None:
+    snapshots = sorted(
+        recovery_dir.glob("step_epoch_*_batch_*_global_*.pt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in snapshots[max(int(keep), 1):]:
+        path.unlink(missing_ok=True)
+
+
+def normalize_checkpoint_path_value(value: Any) -> str:
+    path = Path(str(value)).expanduser()
+    try:
+        return str(path.resolve(strict=False))
+    except OSError:
+        return str(path)
+
+
+def collect_recovery_resume_mismatches(
+    checkpoint: dict[str, Any],
+    args: argparse.Namespace,
+    current_steps_per_epoch: int,
+    tokens_per_frame: int,
+    embed_dim: int,
+    train_dataset_size: int,
+) -> list[dict[str, Any]]:
+    checkpoint_args = dict(checkpoint.get("args", {}))
+    mismatches: list[dict[str, Any]] = []
+
+    def add_mismatch(field: str, current: Any, checkpoint_value: Any, reason: str | None = None) -> None:
+        item = {
+            "field": field,
+            "current": current,
+            "checkpoint": checkpoint_value,
+        }
+        if reason is not None:
+            item["reason"] = reason
+        mismatches.append(item)
+
+    scalar_fields = (
+        "batch_size",
+        "train_sampler",
+        "sequence_stride",
+        "frame_stride",
+        "target_fps",
+        "rollout_state_mode",
+        "rollout_feedback_norm",
+        "predictor_type",
+        "model_size",
+        "predictor_dim",
+        "predictor_depth",
+        "predictor_heads",
+        "dropout",
+        "raw_frames_per_sample",
+        "auto_steps",
+    )
+    for field in scalar_fields:
+        if field not in checkpoint_args:
+            continue
+        checkpoint_value = checkpoint_args[field]
+        current_value = getattr(args, field)
+        if current_value != checkpoint_value:
+            add_mismatch(field, current_value, checkpoint_value)
+
+    for field in ("features_dir", "manifest_dir"):
+        if field not in checkpoint_args:
+            continue
+        current_value = normalize_checkpoint_path_value(getattr(args, field))
+        checkpoint_value = normalize_checkpoint_path_value(checkpoint_args[field])
+        if current_value != checkpoint_value:
+            add_mismatch(field, current_value, checkpoint_value)
+
+    for field in ("state_columns", "action_columns"):
+        if field not in checkpoint_args:
+            continue
+        current_value = list(getattr(args, field))
+        checkpoint_value = list(checkpoint_args[field])
+        if current_value != checkpoint_value:
+            add_mismatch(field, current_value, checkpoint_value, reason="column names/order must match exactly")
+
+    checkpoint_steps_per_epoch = checkpoint.get("steps_per_epoch")
+    if checkpoint_steps_per_epoch is not None and int(checkpoint_steps_per_epoch) != int(current_steps_per_epoch):
+        add_mismatch(
+            "steps_per_epoch",
+            int(current_steps_per_epoch),
+            int(checkpoint_steps_per_epoch),
+            reason=(
+                "Do not resume mid-epoch with changed dataset/batch_size/sampler. "
+                "Start fresh or resume from last.pt."
+            ),
+        )
+
+    checkpoint_feature_metadata = dict(checkpoint.get("feature_metadata", {}))
+    if "tokens_per_frame" in checkpoint_feature_metadata:
+        checkpoint_tokens = int(checkpoint_feature_metadata["tokens_per_frame"])
+        if int(tokens_per_frame) != checkpoint_tokens:
+            add_mismatch("tokens_per_frame", int(tokens_per_frame), checkpoint_tokens)
+    if "embed_dim" in checkpoint_feature_metadata:
+        checkpoint_embed_dim = int(checkpoint_feature_metadata["embed_dim"])
+        if int(embed_dim) != checkpoint_embed_dim:
+            add_mismatch("embed_dim", int(embed_dim), checkpoint_embed_dim)
+
+    metrics = dict(checkpoint.get("metrics", {}))
+    checkpoint_train_sequences = checkpoint_args.get("train_sequences", None)
+    if checkpoint_train_sequences is None and "train_sequences" in metrics:
+        checkpoint_train_sequences = metrics["train_sequences"]
+    if checkpoint_train_sequences is None and "train_dataset_size" in metrics:
+        checkpoint_train_sequences = metrics["train_dataset_size"]
+    if checkpoint_train_sequences is None:
+        # `train_sequences` was added to run_config, not args, so old checkpoints may not have it.
+        checkpoint_run_config = dict(checkpoint.get("run_config", {}))
+        checkpoint_train_sequences = checkpoint_run_config.get("train_sequences", None)
+    if checkpoint_train_sequences is not None and int(checkpoint_train_sequences) != int(train_dataset_size):
+        add_mismatch("train_dataset_size", int(train_dataset_size), int(checkpoint_train_sequences))
+
+    return mismatches
+
+
+def validate_recovery_resume_checkpoint(
+    checkpoint: dict[str, Any],
+    args: argparse.Namespace,
+    current_steps_per_epoch: int,
+    tokens_per_frame: int,
+    embed_dim: int,
+    train_dataset_size: int,
+) -> None:
+    if str(checkpoint.get("phase", PHASE_EPOCH_COMPLETE)) != PHASE_TRAIN_IN_PROGRESS:
+        return
+    mismatches = collect_recovery_resume_mismatches(
+        checkpoint=checkpoint,
+        args=args,
+        current_steps_per_epoch=current_steps_per_epoch,
+        tokens_per_frame=tokens_per_frame,
+        embed_dim=embed_dim,
+        train_dataset_size=train_dataset_size,
+    )
+    if not mismatches:
+        return
+    raise ValueError(
+        "Recovery checkpoint resume config mismatch. Refusing to resume mid-epoch because "
+        "skip_batches would be unsafe. Do not resume mid-epoch with changed dataset/batch_size/"
+        f"sampler. Start fresh or resume from last.pt. Mismatches: {mismatches}"
+    )
+
+
 def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.Namespace) -> None:
     checkpoint_args = dict(checkpoint.get("args", {}))
     legacy_defaults = {
@@ -926,6 +1237,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "target_fps": settings.AC_TARGET_FPS,
         "auto_steps": settings.AC_AUTO_STEPS,
         "rollout_state_mode": ROLLOUT_STATE_MODE_LEGACY_REPEAT,
+        "rollout_feedback_norm": DEFAULT_ROLLOUT_FEEDBACK_NORM,
     }
     checked_fields = (
         "predictor_type",
@@ -934,6 +1246,7 @@ def validate_resume_predictor_config(checkpoint: dict[str, Any], args: argparse.
         "target_fps",
         "auto_steps",
         "rollout_state_mode",
+        "rollout_feedback_norm",
         "predictor_dim",
         "predictor_depth",
         "predictor_heads",
@@ -972,6 +1285,12 @@ def maybe_cleanup_cuda() -> None:
 def main(args: argparse.Namespace | None = None) -> None:
     args = parse_args() if args is None else args
     apply_predictor_size_preset(args)
+    if args.save_every_steps < 0:
+        raise ValueError("--save-every-steps must be >= 0")
+    if args.save_every_minutes < 0:
+        raise ValueError("--save-every-minutes must be >= 0")
+    if args.keep_step_checkpoints < 1:
+        raise ValueError("--keep-step-checkpoints must be >= 1")
     if not getattr(args, "_output_dir_was_provided", False):
         suffix_parts = []
         if args.predictor_type != DEFAULT_PREDICTOR_TYPE:
@@ -1051,15 +1370,56 @@ def main(args: argparse.Namespace | None = None) -> None:
     resumed_from = None
     resume_phase = "train"
     resumed_train_metrics: dict[str, float] | None = None
+    resume_skip_batches = 0
+    resume_train_totals: dict[str, float] | None = None
+    resume_train_total_samples = 0
     resume_checkpoint: dict[str, Any] | None = None
     if args.resume_from is not None:
         resumed_from = args.resume_from
         resume_checkpoint = load_resume_checkpoint(args.resume_from, predictor, optimizer, device, args)
-        resume_phase = str(resume_checkpoint.get("phase", "epoch_complete"))
-        if resume_phase == "train_complete_waiting_val":
+        resume_phase = str(resume_checkpoint.get("phase", PHASE_EPOCH_COMPLETE))
+        if resume_phase == PHASE_TRAIN_COMPLETE_WAITING_VAL:
             start_epoch = int(resume_checkpoint["epoch"])
             metrics_payload = resume_checkpoint.get("metrics", {})
             resumed_train_metrics = dict(metrics_payload.get("train", {}))
+        elif resume_phase == PHASE_TRAIN_IN_PROGRESS:
+            validate_recovery_resume_checkpoint(
+                checkpoint=resume_checkpoint,
+                args=args,
+                current_steps_per_epoch=steps_per_epoch,
+                tokens_per_frame=tokens_per_frame,
+                embed_dim=embed_dim,
+                train_dataset_size=len(train_dataset),
+            )
+            start_epoch = int(resume_checkpoint["epoch"])
+            resume_step_in_epoch = int(resume_checkpoint.get("step_in_epoch", 0))
+            resume_steps_per_epoch = int(resume_checkpoint.get("steps_per_epoch", steps_per_epoch))
+            resume_train_totals = {
+                key: float(value)
+                for key, value in dict(resume_checkpoint.get("train_totals", {})).items()
+            }
+            resume_train_total_samples = int(resume_checkpoint.get("train_total_samples", 0))
+            if resume_step_in_epoch >= resume_steps_per_epoch:
+                resume_phase = PHASE_TRAIN_COMPLETE_WAITING_VAL
+                if resume_train_totals and resume_train_total_samples > 0:
+                    resumed_train_metrics = average_metrics(resume_train_totals, resume_train_total_samples)
+                else:
+                    metrics_payload = resume_checkpoint.get("metrics", {})
+                    resumed_train_metrics = dict(metrics_payload.get("train_partial", {}))
+                resume_skip_batches = 0
+            elif args.train_sampler == "session":
+                resume_skip_batches = resume_step_in_epoch
+            else:
+                print(
+                    "[resume] recovery checkpoint was saved mid-epoch, but train_sampler is not "
+                    "'session'. The current DataLoader order is not exactly reproducible, so the "
+                    "trainer will reload weights/optimizer/scheduler and rerun the epoch from "
+                    "batch 1 instead of skipping batches.",
+                    flush=True,
+                )
+                resume_skip_batches = 0
+                resume_train_totals = None
+                resume_train_total_samples = 0
         else:
             start_epoch = int(resume_checkpoint["epoch"]) + 1
         best_val_loss = float(resume_checkpoint.get("best_val_loss", best_val_loss))
@@ -1088,12 +1448,76 @@ def main(args: argparse.Namespace | None = None) -> None:
     watch_model(wandb_run, predictor, args)
     try:
         final_epoch = start_epoch - 1
+        last_recovery_save_step = global_step
+        last_recovery_save_time = time.monotonic()
         for epoch in range(start_epoch, args.epochs + 1):
             final_epoch = epoch
             set_dataloader_epoch(dataloaders["train"], epoch)
-            if epoch == start_epoch and resume_phase == "train_complete_waiting_val" and resumed_train_metrics is not None:
+            if epoch == start_epoch and resume_phase == PHASE_TRAIN_COMPLETE_WAITING_VAL and resumed_train_metrics is not None:
                 train_metrics = resumed_train_metrics
             else:
+                epoch_skip_batches = (
+                    resume_skip_batches
+                    if epoch == start_epoch and resume_phase == PHASE_TRAIN_IN_PROGRESS
+                    else 0
+                )
+                epoch_initial_totals = resume_train_totals if epoch_skip_batches > 0 else None
+                epoch_initial_total_samples = resume_train_total_samples if epoch_skip_batches > 0 else 0
+                if epoch_skip_batches > 0:
+                    print(
+                        f"[resume] continuing epoch {epoch} from recovery checkpoint: "
+                        f"skipping {epoch_skip_batches}/{steps_per_epoch} completed train batches.",
+                        flush=True,
+                    )
+
+                def maybe_save_recovery_checkpoint(
+                    step_in_epoch: int,
+                    current_global_step: int,
+                    train_partial_metrics: dict[str, float],
+                    train_totals: dict[str, float],
+                    train_total_samples: int,
+                ) -> None:
+                    nonlocal last_recovery_save_step, last_recovery_save_time
+                    step_interval = int(args.save_every_steps)
+                    minute_interval = float(args.save_every_minutes)
+                    due_to_steps = (
+                        step_interval > 0
+                        and current_global_step > last_recovery_save_step
+                        and (current_global_step - last_recovery_save_step) >= step_interval
+                    )
+                    elapsed_minutes = (time.monotonic() - last_recovery_save_time) / 60.0
+                    due_to_time = minute_interval > 0 and elapsed_minutes >= minute_interval
+                    if not (due_to_steps or due_to_time):
+                        return
+                    save_recovery_checkpoint(
+                        predictor=predictor,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch,
+                        steps_per_epoch_value=steps_per_epoch,
+                        args=args,
+                        train_metrics=train_partial_metrics,
+                        train_totals=train_totals,
+                        train_total_samples=train_total_samples,
+                        train_dataset_size=len(train_dataset),
+                        normalization=normalization_metadata,
+                        feature_metadata=feature_metadata,
+                        best_val_loss=best_val_loss,
+                        best_epoch=best_epoch,
+                        global_step=current_global_step,
+                        epochs_without_improvement=epochs_without_improvement,
+                        history=history,
+                    )
+                    last_recovery_save_step = current_global_step
+                    last_recovery_save_time = time.monotonic()
+                    print(
+                        f"[checkpoint] saved {args.output_dir / RECOVERY_CHECKPOINT_NAME} "
+                        f"at epoch={epoch} batch={step_in_epoch}/{steps_per_epoch} "
+                        f"global_step={current_global_step}",
+                        flush=True,
+                    )
+
                 train_metrics, global_step = run_epoch(
                     predictor=predictor,
                     dataloader=dataloaders["train"],
@@ -1106,6 +1530,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     state_columns=tuple(args.state_columns),
                     action_columns=tuple(args.action_columns),
                     rollout_state_mode=args.rollout_state_mode,
+                    rollout_feedback_norm=args.rollout_feedback_norm,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} train",
                     show_progress=not args.no_progress,
                     wandb_run=wandb_run,
@@ -1116,6 +1541,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                     wandb_grad_stats_every=args.wandb_grad_stats_every,
                     wandb_param_stats_every=args.wandb_param_stats_every,
                     amp_dtype=args.amp_dtype,
+                    skip_batches=epoch_skip_batches,
+                    initial_totals=epoch_initial_totals,
+                    initial_total_samples=epoch_initial_total_samples,
+                    checkpoint_callback=maybe_save_recovery_checkpoint,
                 )
                 train_only_metrics = {"epoch": epoch, "train": train_metrics}
                 save_checkpoint(
@@ -1133,7 +1562,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     global_step,
                     epochs_without_improvement,
                     history,
-                    phase="train_complete_waiting_val",
+                    phase=PHASE_TRAIN_COMPLETE_WAITING_VAL,
                 )
             optimizer.zero_grad(set_to_none=True)
             maybe_cleanup_cuda()
@@ -1150,6 +1579,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     state_columns=tuple(args.state_columns),
                     action_columns=tuple(args.action_columns),
                     rollout_state_mode=args.rollout_state_mode,
+                    rollout_feedback_norm=args.rollout_feedback_norm,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val",
                     show_progress=not args.no_progress,
                     amp_dtype=args.amp_dtype,
@@ -1169,6 +1599,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     max_batches=args.val_rollout_eval_max_batches,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val rollout",
                     rollout_eval_state_mode=args.rollout_eval_state_mode,
+                    rollout_feedback_norm=args.rollout_feedback_norm,
                 )
                 val_metrics.update(val_rollout_metrics)
 
@@ -1212,7 +1643,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     global_step,
                     epochs_without_improvement,
                     history,
-                    phase="epoch_complete",
+                    phase=PHASE_EPOCH_COMPLETE,
                 )
             if improved:
                 save_checkpoint(
@@ -1230,7 +1661,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     global_step,
                     epochs_without_improvement,
                     history,
-                    phase="epoch_complete",
+                    phase=PHASE_EPOCH_COMPLETE,
                 )
 
             log_metrics(
@@ -1293,6 +1724,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 show_progress=not args.no_progress,
                 amp_dtype=args.amp_dtype,
                 rollout_eval_state_mode=args.rollout_eval_state_mode,
+                rollout_feedback_norm=args.rollout_feedback_norm,
             )
             final_eval_payload = {
                 "split": "val",
@@ -1354,6 +1786,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 action_penalty=args.final_planning_action_penalty,
                 smooth_penalty=args.final_planning_smooth_penalty,
                 show_progress=not args.no_progress,
+                rollout_feedback_norm=args.rollout_feedback_norm,
             )
             final_planning_payload = {
                 "split": "val",
@@ -1394,6 +1827,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 state_columns=tuple(args.state_columns),
                 action_columns=tuple(args.action_columns),
                 rollout_state_mode=args.rollout_state_mode,
+                rollout_feedback_norm=args.rollout_feedback_norm,
                 label="test",
                 show_progress=not args.no_progress,
                 amp_dtype=args.amp_dtype,

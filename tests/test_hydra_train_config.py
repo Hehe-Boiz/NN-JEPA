@@ -20,6 +20,7 @@ class HydraTrainConfigTests(unittest.TestCase):
                     "sequence_stride": 1,
                     "auto_steps": 2,
                     "rollout_state_mode": "measured_train",
+                    "rollout_feedback_norm": True,
                 },
                 "model": {
                     "type": "official_lite",
@@ -41,6 +42,9 @@ class HydraTrainConfigTests(unittest.TestCase):
                     "warmup_start_factor": 0.1,
                     "min_lr_ratio": 0.1,
                     "early_stopping_patience": 2,
+                    "save_every_steps": 25,
+                    "save_every_minutes": 3.5,
+                    "keep_step_checkpoints": 2,
                     "rollout_eval_state_mode": "both",
                     "resume_from": None,
                     "seed": 123,
@@ -74,7 +78,11 @@ class HydraTrainConfigTests(unittest.TestCase):
         self.assertTrue(args._output_dir_was_provided)
         self.assertEqual(args.state_columns, ["yaw_rate_t", "accel_x_t"])
         self.assertEqual(args.rollout_state_mode, "measured_train")
+        self.assertTrue(args.rollout_feedback_norm)
         self.assertEqual(args.rollout_eval_state_mode, "both")
+        self.assertEqual(args.save_every_steps, 25)
+        self.assertEqual(args.save_every_minutes, 3.5)
+        self.assertEqual(args.keep_step_checkpoints, 2)
         self.assertEqual(args.batch_size, 4)
         self.assertEqual(args.device, "cpu")
         self.assertFalse(args.skip_test)

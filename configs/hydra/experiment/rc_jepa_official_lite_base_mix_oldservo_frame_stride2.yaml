@@ -42,7 +42,7 @@ model:
 train:
   epochs: 100
   batch_size: 20
-  eval_batch_size: 4
+  eval_batch_size: 8
   num_workers: 4
   train_sampler: session
   eval_sampler: session
@@ -54,6 +54,9 @@ train:
   min_lr_ratio: 0.1
   early_stopping_patience: 15
   amp_dtype: bf16
+  save_every_steps: 0
+  save_every_minutes: 20.0
+  keep_step_checkpoints: 1
   rollout_eval_state_mode: both
   val_rollout_eval_horizon: 3
   val_rollout_eval_max_batches: 256

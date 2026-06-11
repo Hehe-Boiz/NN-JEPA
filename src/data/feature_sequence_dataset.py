@@ -17,6 +17,7 @@ from .sequence_dataset import (
     DEFAULT_AC_ACTION_COLUMNS,
     DEFAULT_AC_STATE_COLUMNS,
     build_ac_action_normalizer,
+    build_action_row,
     build_sequence_windows,
     timestamp_to_float,
 )
@@ -180,7 +181,7 @@ class RCJepaACFeatureSequenceDataset(Dataset):
         )
 
         states = [dict(sample["state"]) for sample in sequence]
-        actions = [dict(sample["action"]) for sample in sequence[:-1]]
+        actions = [build_action_row(sample, self.action_columns) for sample in sequence[:-1]]
         if self.state_normalizer is None:
             state_values = [[state[column] for column in self.state_columns] for state in states]
         else:

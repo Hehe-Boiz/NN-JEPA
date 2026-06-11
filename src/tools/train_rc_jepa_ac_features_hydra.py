@@ -37,6 +37,7 @@ def build_train_args(cfg: Any) -> Namespace:
     args.target_fps = float(data_cfg.get("target_fps", args.target_fps))
     args.auto_steps = int(data_cfg.get("auto_steps", args.auto_steps))
     args.rollout_state_mode = str(data_cfg.get("rollout_state_mode", args.rollout_state_mode))
+    args.rollout_feedback_norm = bool(data_cfg.get("rollout_feedback_norm", args.rollout_feedback_norm))
 
     args.predictor_type = str(model_cfg.get("type", args.predictor_type))
     args.model_size = str(model_cfg.get("size", args.model_size))
@@ -59,6 +60,11 @@ def build_train_args(cfg: Any) -> Namespace:
     args.min_lr_ratio = float(train_cfg.get("min_lr_ratio", args.min_lr_ratio))
     args.early_stopping_patience = int(train_cfg.get("early_stopping_patience", args.early_stopping_patience))
     args.amp_dtype = str(train_cfg.get("amp_dtype", args.amp_dtype))
+    args.save_every_steps = int(train_cfg.get("save_every_steps", args.save_every_steps))
+    args.save_every_minutes = float(train_cfg.get("save_every_minutes", args.save_every_minutes))
+    args.keep_step_checkpoints = int(
+        train_cfg.get("keep_step_checkpoints", args.keep_step_checkpoints)
+    )
     args.final_eval_horizon = int(train_cfg.get("final_eval_horizon", args.final_eval_horizon))
     args.rollout_eval_state_mode = str(
         train_cfg.get("rollout_eval_state_mode", args.rollout_eval_state_mode)

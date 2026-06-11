@@ -753,10 +753,11 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
   --lr 1e-4
 ```
 
-Checkpoint của `train_rc_jepa_ac_features` hiện có 2 mức resume:
+Checkpoint của `train_rc_jepa_ac_features` hiện có 3 mức resume:
 
 - `last.pt`: lưu sau khi xong cả `train` và `val` của một epoch
 - `last_train.pt`: lưu ngay sau khi xong `train` của epoch, trước khi bước vào `val`
+- `recovery_step.pt`: lưu giữa epoch để chống cúp điện/crash khi epoch quá dài
 
 Nếu run bị dừng giữa `val`, đặc biệt là OOM ở `val`, resume bằng:
 
@@ -773,6 +774,22 @@ PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features \
 ```
 
 Script sẽ nhận ra checkpoint đang ở pha `train_complete_waiting_val` và đi tiếp vào `val` của đúng epoch đó, không train lại epoch vừa xong.
+
+Nếu run bị dừng giữa `train` khi epoch đang chạy lâu, resume bằng `recovery_step.pt`:
+
+```bash
+PYTHONPATH=src python3 -m tools.train_rc_jepa_ac_features_hydra \
+  experiment=rc_jepa_official_lite_base_mix_oldservo_frame_stride2 \
+  train.resume_from=checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_official_lite_base_frame_stride2/recovery_step.pt
+```
+
+Logic của `recovery_step.pt`:
+
+- mặc định config mixed lưu recovery mỗi `20` phút bằng `train.save_every_minutes=20.0`
+- `train.save_every_steps=0` nghĩa là không lưu theo số step; muốn lưu mỗi 500 step thì override `train.save_every_steps=500`
+- nếu `train_sampler=session`, resume sẽ set lại epoch sampler rồi skip đúng số batch đã hoàn thành trong epoch đó
+- nếu dùng `train_sampler=global`, thứ tự shuffle của DataLoader không được bảo đảm tái tạo chính xác, nên resume sẽ load weights/optimizer/scheduler rồi chạy lại epoch đó từ batch 1
+- `best.pt` vẫn chỉ được chọn sau khi val xong, dựa trên `val/loss`
 
 W&B resume cùng một run:
 

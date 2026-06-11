@@ -9,7 +9,9 @@ import torch
 import torch.nn.functional as F
 
 from data.normalization import FeatureNormalizer
-from models.rc_jepa_ac import build_rollout_state_context
+from models.rc_jepa_ac import build_rollout_state_context, normalize_rollout_feedback
+
+DEFAULT_CONTROLLABLE_ACTION_COLUMNS = ("steering_cmd_t", "throttle_cmd_t")
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,36 @@ class CEMPlanResult:
     action_sequence: torch.Tensor
     score: float
     iterations: int
+
+
+def controllable_action_indices(
+    action_columns: Sequence[str],
+    controllable_action_columns: Sequence[str] = DEFAULT_CONTROLLABLE_ACTION_COLUMNS,
+) -> tuple[int, ...]:
+    """Return action indices that CEM is allowed to optimize."""
+    action_columns = tuple(action_columns)
+    return tuple(index for index, column in enumerate(action_columns) if column in controllable_action_columns)
+
+
+def fixed_action_indices(
+    action_columns: Sequence[str],
+    controllable_action_columns: Sequence[str] = DEFAULT_CONTROLLABLE_ACTION_COLUMNS,
+) -> tuple[int, ...]:
+    """Return conditioning action indices that must be copied, not optimized."""
+    controllable = set(controllable_action_columns)
+    return tuple(index for index, column in enumerate(action_columns) if column not in controllable)
+
+
+def make_zero_control_actions(
+    actions: torch.Tensor,
+    action_columns: Sequence[str],
+    controllable_action_columns: Sequence[str] = DEFAULT_CONTROLLABLE_ACTION_COLUMNS,
+) -> torch.Tensor:
+    """Zero only controllable commands while preserving domain/context columns."""
+    zero_actions = actions.clone()
+    for index in controllable_action_indices(action_columns, controllable_action_columns):
+        zero_actions[..., index] = 0.0
+    return zero_actions
 
 
 def normalizer_stats_tensors(
@@ -105,6 +137,8 @@ class RCJepaACFeatureCEMPlanner:
         action_penalty: float = 0.0,
         smooth_penalty: float = 0.0,
         device: torch.device | str = "cuda",
+        rollout_feedback_norm: bool = False,
+        controllable_action_columns: Sequence[str] = DEFAULT_CONTROLLABLE_ACTION_COLUMNS,
     ) -> None:
         if horizon < 1:
             raise ValueError("horizon must be >= 1")
@@ -120,6 +154,17 @@ class RCJepaACFeatureCEMPlanner:
         self.state_columns = tuple(state_columns)
         self.action_columns = tuple(action_columns)
         self.action_dim = len(self.action_columns)
+        self.controllable_action_columns = tuple(controllable_action_columns)
+        self.controllable_indices = controllable_action_indices(
+            self.action_columns,
+            self.controllable_action_columns,
+        )
+        self.fixed_indices = fixed_action_indices(
+            self.action_columns,
+            self.controllable_action_columns,
+        )
+        if not self.controllable_indices:
+            raise ValueError("CEM planner needs at least one controllable action column")
         self.action_normalizer = action_normalizer
         self.horizon = int(horizon)
         self.n_samples = int(n_samples)
@@ -129,11 +174,16 @@ class RCJepaACFeatureCEMPlanner:
         self.min_std = float(min_std)
         self.action_penalty = float(action_penalty)
         self.smooth_penalty = float(smooth_penalty)
+        self.rollout_feedback_norm = bool(rollout_feedback_norm)
         self.device = torch.device(device)
         self.action_low = self._action_bound_tensor(action_low, "action_low")
         self.action_high = self._action_bound_tensor(action_high, "action_high")
         if torch.any(self.action_low >= self.action_high):
             raise ValueError("Every action_low value must be smaller than action_high")
+        self._controllable_index_tensor = torch.tensor(self.controllable_indices, dtype=torch.long, device=self.device)
+        self._fixed_index_tensor = torch.tensor(self.fixed_indices, dtype=torch.long, device=self.device)
+        self.control_action_low = self.action_low.index_select(0, self._controllable_index_tensor)
+        self.control_action_high = self.action_high.index_select(0, self._controllable_index_tensor)
 
     def _action_bound_tensor(
         self,
@@ -146,6 +196,47 @@ class RCJepaACFeatureCEMPlanner:
         if tensor.numel() != self.action_dim:
             raise ValueError(f"{name} must have {self.action_dim} values, got {tensor.numel()}")
         return tensor.view(self.action_dim)
+
+    def _reference_action_sequence(self, reference_actions: torch.Tensor | None) -> torch.Tensor:
+        if not self.fixed_indices:
+            return torch.zeros(self.horizon, self.action_dim, dtype=torch.float32, device=self.device)
+        if reference_actions is None:
+            fixed_names = [self.action_columns[index] for index in self.fixed_indices]
+            raise ValueError(
+                "CEM planner found non-controllable action columns "
+                f"{fixed_names}; pass reference_actions so they can be held fixed."
+            )
+        reference = reference_actions.to(self.device, dtype=torch.float32)
+        if reference.ndim == 1:
+            reference = reference.view(1, self.action_dim).expand(self.horizon, -1).contiguous()
+        elif reference.ndim == 2:
+            if reference.size(0) < self.horizon:
+                raise ValueError(
+                    f"reference_actions must have at least horizon={self.horizon} steps, got {reference.size(0)}"
+                )
+            reference = reference[: self.horizon]
+        elif reference.ndim == 3:
+            if reference.size(0) != 1:
+                raise ValueError("reference_actions with 3 dims must have batch size 1")
+            if reference.size(1) < self.horizon:
+                raise ValueError(
+                    f"reference_actions must have at least horizon={self.horizon} steps, got {reference.size(1)}"
+                )
+            reference = reference[0, : self.horizon]
+        else:
+            raise ValueError(f"Expected reference_actions [A], [H,A], or [1,H,A], got {tuple(reference.shape)}")
+        if reference.size(-1) != self.action_dim:
+            raise ValueError(f"reference_actions action_dim must be {self.action_dim}, got {reference.size(-1)}")
+        return reference.contiguous()
+
+    def _compose_full_action_samples(
+        self,
+        control_samples: torch.Tensor,
+        reference_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        samples = reference_actions.unsqueeze(0).expand(control_samples.size(0), -1, -1).clone()
+        samples.index_copy_(-1, self._controllable_index_tensor, control_samples)
+        return samples
 
     @torch.no_grad()
     def rollout(
@@ -222,7 +313,8 @@ class RCJepaACFeatureCEMPlanner:
             )
             next_tokens = pred_tokens[:, -self.tokens_per_frame :]
             predictions.append(next_tokens)
-            rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+            feedback_tokens = normalize_rollout_feedback(next_tokens, enabled=self.rollout_feedback_norm)
+            rollout_tokens = torch.cat([rollout_tokens, feedback_tokens], dim=1)
         return torch.stack(predictions, dim=1)
 
     @torch.no_grad()
@@ -247,10 +339,11 @@ class RCJepaACFeatureCEMPlanner:
 
         score = F.l1_loss(final_prediction, goal_tokens, reduction="none").mean(dim=(1, 2))
         raw_actions = raw_actions.to(self.device, dtype=torch.float32)
+        control_actions = raw_actions.index_select(-1, self._controllable_index_tensor)
         if self.action_penalty > 0:
-            score = score + self.action_penalty * raw_actions.square().mean(dim=(1, 2))
-        if self.smooth_penalty > 0 and raw_actions.size(1) > 1:
-            score = score + self.smooth_penalty * (raw_actions[:, 1:] - raw_actions[:, :-1]).square().mean(dim=(1, 2))
+            score = score + self.action_penalty * control_actions.square().mean(dim=(1, 2))
+        if self.smooth_penalty > 0 and control_actions.size(1) > 1:
+            score = score + self.smooth_penalty * (control_actions[:, 1:] - control_actions[:, :-1]).square().mean(dim=(1, 2))
         return score
 
     @torch.no_grad()
@@ -259,17 +352,21 @@ class RCJepaACFeatureCEMPlanner:
         context_tokens: torch.Tensor,
         initial_state: torch.Tensor,
         goal_tokens: torch.Tensor,
+        reference_actions: torch.Tensor | None = None,
     ) -> CEMPlanResult:
         """Run CEM and return the best raw action sequence."""
-        mu = torch.zeros(self.horizon, self.action_dim, device=self.device)
+        reference_sequence = self._reference_action_sequence(reference_actions)
+        control_dim = len(self.controllable_indices)
+        mu = torch.zeros(self.horizon, control_dim, device=self.device)
         sigma = torch.full_like(mu, self.init_std)
         best_score: torch.Tensor | None = None
         best_sequence: torch.Tensor | None = None
 
         for _ in range(self.n_iter):
-            eps = torch.randn(self.n_samples, self.horizon, self.action_dim, device=self.device)
-            samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
-            samples = torch.maximum(torch.minimum(samples, self.action_high), self.action_low)
+            eps = torch.randn(self.n_samples, self.horizon, control_dim, device=self.device)
+            control_samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
+            control_samples = torch.maximum(torch.minimum(control_samples, self.control_action_high), self.control_action_low)
+            samples = self._compose_full_action_samples(control_samples, reference_sequence)
             scores = self.score(
                 context_tokens=context_tokens,
                 initial_state=initial_state,
@@ -277,7 +374,7 @@ class RCJepaACFeatureCEMPlanner:
                 raw_actions=samples,
             )
             elite_indices = torch.topk(scores, self.n_elite, largest=False).indices
-            elites = samples[elite_indices]
+            elites = control_samples[elite_indices]
             mu = elites.mean(dim=0)
             sigma = elites.std(dim=0, unbiased=False).clamp_min(self.min_std)
 

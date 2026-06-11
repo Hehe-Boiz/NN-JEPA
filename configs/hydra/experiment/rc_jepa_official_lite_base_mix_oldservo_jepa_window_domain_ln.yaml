@@ -1,6 +1,11 @@
 # @package _global_
 
-output_dir: checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_official_lite_tiny_frame_stride2
+# JEPA-style mixed-servo experiment:
+# - horizon/window = 4 frames with frame_stride=2, matching JEPA's lighter AC window.
+# - action token includes synthetic domain_id: 0=old/KDS servo, 1=current/TowerPro servo.
+# - autoregressive rollout re-LayerNorms predicted latent before feeding it back.
+
+output_dir: checkpoints/rc_jepa_official_lite_base_mix_oldservo_jepa_window_domain_ln
 
 runtime:
   dry_run: false
@@ -18,16 +23,18 @@ data:
   action_columns:
     - steering_cmd_t
     - throttle_cmd_t
-  raw_frames_per_sample: 8
+    - domain_id
+  raw_frames_per_sample: 4
   sequence_stride: 1
   frame_stride: 2
   target_fps: 0.0
   auto_steps: 2
   rollout_state_mode: measured_train
+  rollout_feedback_norm: true
 
 model:
   type: official_lite
-  size: tiny
+  size: base
   predictor_dim: null
   predictor_depth: null
   predictor_heads: null
@@ -36,11 +43,11 @@ model:
 train:
   epochs: 100
   batch_size: 32
-  eval_batch_size: 2
-  num_workers: 6
+  eval_batch_size: 8
+  num_workers: 4
   train_sampler: session
   eval_sampler: session
-  lr: 1.0e-4
+  lr: 5.0e-5
   weight_decay: 1.0e-4
   grad_clip: 1.0
   warmup_epochs: 5
@@ -55,10 +62,10 @@ train:
   val_rollout_eval_horizon: 3
   val_rollout_eval_max_batches: 256
   final_eval_horizon: 3
-  final_planning_eval_samples: 32
+  final_planning_eval_samples: 0
   final_planning_horizon: 0
   final_planning_goal_offset: 0
-  final_planning_cem_samples: 64
+  final_planning_cem_samples: 32
   final_planning_cem_elites: 8
   final_planning_cem_iters: 3
   final_planning_init_std: 0.5
@@ -75,18 +82,20 @@ wandb:
   disabled: false
   project: nn-jepa-rc
   entity: null
-  run_name: rc-jepa-official-lite-tiny-mix-oldservo-frame-stride2
+  run_name: rc-jepa-official-lite-base-mix-oldservo-jepa-window-domain-ln
   run_id: null
   continue_run: true
   resume: allow
   mode: online
   tags:
     - official_lite
-    - tiny
+    - base
     - hydra
     - mixed-servo
     - old-servo
-    - frame-stride2
+    - jepa-window
+    - domain-id
+    - rollout-feedback-ln
   log_every: 50
   watch_log: gradients
   watch_freq: 200

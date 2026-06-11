@@ -31,6 +31,7 @@ SUPPORTED_PREDICTOR_TYPES = ("simple", "official_lite")
 ROLLOUT_STATE_MODE_LEGACY_REPEAT = "legacy_repeat"
 ROLLOUT_STATE_MODE_MEASURED_TRAIN = "measured_train"
 DEFAULT_ROLLOUT_STATE_MODE = ROLLOUT_STATE_MODE_MEASURED_TRAIN
+DEFAULT_ROLLOUT_FEEDBACK_NORM = False
 SUPPORTED_ROLLOUT_STATE_MODES = (
     ROLLOUT_STATE_MODE_LEGACY_REPEAT,
     ROLLOUT_STATE_MODE_MEASURED_TRAIN,
@@ -769,6 +770,7 @@ class RCJepaACWorldModel(nn.Module):
         dropout: float = 0.0,
         auto_steps: int = settings.AC_AUTO_STEPS,
         rollout_state_mode: str = DEFAULT_ROLLOUT_STATE_MODE,
+        rollout_feedback_norm: bool = DEFAULT_ROLLOUT_FEEDBACK_NORM,
         strict_checkpoint: bool = True,
     ) -> None:
         super().__init__()
@@ -779,6 +781,7 @@ class RCJepaACWorldModel(nn.Module):
         self.action_columns = tuple(action_columns)
         self.predictor_type = predictor_type
         self.rollout_state_mode = rollout_state_mode
+        self.rollout_feedback_norm = bool(rollout_feedback_norm)
         self.target_encoder = FrozenVJepa21Encoder(
             vjepa_root=vjepa_root,
             checkpoint_path=checkpoint_path,
@@ -824,6 +827,7 @@ class RCJepaACWorldModel(nn.Module):
             state_columns=self.state_columns,
             action_columns=self.action_columns,
             rollout_state_mode=self.rollout_state_mode,
+            rollout_feedback_norm=self.rollout_feedback_norm,
         )
 
 
@@ -837,6 +841,7 @@ def compute_world_model_losses(
     state_columns: tuple[str, ...] | None = None,
     action_columns: tuple[str, ...] | None = None,
     rollout_state_mode: str = DEFAULT_ROLLOUT_STATE_MODE,
+    rollout_feedback_norm: bool = DEFAULT_ROLLOUT_FEEDBACK_NORM,
 ) -> dict[str, torch.Tensor]:
     if auto_steps < 1:
         raise ValueError("auto_steps must be >= 1")
@@ -894,7 +899,8 @@ def compute_world_model_losses(
         )
         next_tokens = pred_tokens[:, -tokens_per_frame:]
         rollout_predictions.append(next_tokens)
-        rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+        feedback_tokens = normalize_rollout_feedback(next_tokens, enabled=rollout_feedback_norm)
+        rollout_tokens = torch.cat([rollout_tokens, feedback_tokens], dim=1)
 
     rollout_pred = torch.cat(rollout_predictions, dim=1)
     rollout_target = latents[:, tokens_per_frame : tokens_per_frame * (rollout_steps + 1)]
@@ -906,6 +912,19 @@ def compute_world_model_losses(
         "teacher_forcing_loss": teacher_forcing_loss,
         "rollout_loss": rollout_loss,
     }
+
+
+def normalize_rollout_feedback(tokens: torch.Tensor, enabled: bool) -> torch.Tensor:
+    """Optionally re-normalize predicted latent tokens before rollout feedback.
+
+    V-JEPA/JEPA-style AC rollout feeds predicted latent frames back into the
+    predictor after a per-token LayerNorm. The target feature cache is already
+    LayerNorm-normalized at extraction time, so this keeps autoregressive inputs
+    in the same latent scale.
+    """
+    if not enabled:
+        return tokens
+    return F.layer_norm(tokens, (tokens.size(-1),))
 
 
 def build_rollout_state_context(

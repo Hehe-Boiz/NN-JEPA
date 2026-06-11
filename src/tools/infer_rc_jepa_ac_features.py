@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 
 from data import settings
 from data.feature_sequence_dataset import create_ac_feature_sequence_dataloaders
-from models.rc_jepa_ac import build_rollout_state_context
+from models.rc_jepa_ac import build_rollout_state_context, normalize_rollout_feedback
 from tools.rc_jepa_ac_feature_runtime import (
     DEFAULT_FEATURES_DIR,
     FeaturePredictorConfig,
@@ -113,7 +113,8 @@ def predict_batch(
         )
         next_tokens = pred_tokens[:, -tokens_per_frame:]
         rollout_predictions.append(next_tokens)
-        rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+        feedback_tokens = normalize_rollout_feedback(next_tokens, enabled=config.rollout_feedback_norm)
+        rollout_tokens = torch.cat([rollout_tokens, feedback_tokens], dim=1)
 
     rollout_pred = torch.cat(rollout_predictions, dim=1)
     rollout_target = latents[:, tokens_per_frame : tokens_per_frame * (rollout_steps + 1)]

@@ -33,6 +33,7 @@ class FeaturePredictorConfig:
     target_fps: float
     auto_steps: int
     rollout_state_mode: str
+    rollout_feedback_norm: bool
     predictor_type: str
     predictor_dim: int
     predictor_depth: int
@@ -104,6 +105,7 @@ def config_from_checkpoint(checkpoint: dict[str, Any]) -> FeaturePredictorConfig
         target_fps=float(checkpoint_args.get("target_fps", settings.AC_TARGET_FPS)),
         auto_steps=int(checkpoint_args.get("auto_steps", settings.AC_AUTO_STEPS)),
         rollout_state_mode=str(checkpoint_args.get("rollout_state_mode", ROLLOUT_STATE_MODE_LEGACY_REPEAT)),
+        rollout_feedback_norm=bool(checkpoint_args.get("rollout_feedback_norm", False)),
         predictor_type=str(checkpoint_args.get("predictor_type", DEFAULT_PREDICTOR_TYPE)),
         predictor_dim=int(checkpoint_args.get("predictor_dim", DEFAULT_PREDICTOR_DIM)),
         predictor_depth=int(checkpoint_args.get("predictor_depth", DEFAULT_PREDICTOR_DEPTH)),

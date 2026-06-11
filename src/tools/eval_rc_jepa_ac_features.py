@@ -132,6 +132,7 @@ def main() -> None:
                     state_columns=config.state_columns,
                     action_columns=config.action_columns,
                     rollout_state_mode=config.rollout_state_mode,
+                    rollout_feedback_norm=config.rollout_feedback_norm,
                     label=f"eval {split}",
                     show_progress=not args.no_progress,
                 )
@@ -149,6 +150,7 @@ def main() -> None:
                         max_batches=args.rollout_eval_max_batches,
                         label=f"eval {split} rollout",
                         rollout_eval_state_mode=args.rollout_eval_state_mode,
+                        rollout_feedback_norm=config.rollout_feedback_norm,
                     )
                     metrics.update(flatten_rollout_eval_metric_keys(rollout_metrics))
                 metrics_by_split[split] = metrics

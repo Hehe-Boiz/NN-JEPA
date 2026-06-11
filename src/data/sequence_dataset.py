@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import random
 from typing import Any, Sequence
+import warnings
 
 from PIL import Image, ImageEnhance, ImageFilter
 import torch
@@ -19,6 +20,21 @@ from .normalization import FeatureNormalizer, build_feature_normalizer
 
 DEFAULT_AC_STATE_COLUMNS = tuple(settings.AC_STATE_COLUMNS)
 DEFAULT_AC_ACTION_COLUMNS = tuple(settings.AC_ACTION_COLUMNS)
+DOMAIN_ID_ACTION_COLUMN = "domain_id"
+DEFAULT_DOMAIN_ID = 1.0
+DOMAIN_ID_BY_DATA_DOMAIN = {
+    "old": 0.0,
+    "old_servo": 0.0,
+    "kds": 0.0,
+    "kds_680hv": 0.0,
+    "data servo cũ kds 680hv": 0.0,
+    "current": 1.0,
+    "current_servo": 1.0,
+    "new_servo": 1.0,
+    "towerpro": 1.0,
+    "tower_pro": 1.0,
+}
+_WARNED_DOMAIN_KEYS: set[str] = set()
 
 
 class SequenceAugmentor:
@@ -133,7 +149,7 @@ class RCJepaACSequenceDataset(Dataset):
                 images.append(image.convert("RGB"))
 
         states = [dict(sample["state"]) for sample in sequence]
-        actions = [dict(sample["action"]) for sample in sequence[:-1]]
+        actions = [build_action_row(sample, self.action_columns) for sample in sequence[:-1]]
         if self.augmentor is not None:
             images, states, actions = self.augmentor(images, states, actions)
 
@@ -235,7 +251,48 @@ def has_required_columns(
     action = sample.get("action")
     if not isinstance(state, dict) or not isinstance(action, dict):
         return False
-    return all(column in state for column in state_columns) and all(column in action for column in action_columns)
+    return all(column in state for column in state_columns) and all(
+        column == DOMAIN_ID_ACTION_COLUMN or column in action
+        for column in action_columns
+    )
+
+
+def build_action_row(sample: dict[str, Any], action_columns: Sequence[str]) -> dict[str, float]:
+    """Return an action row, including synthetic domain_id when requested."""
+    action = dict(sample.get("action", {}))
+    if DOMAIN_ID_ACTION_COLUMN in action_columns:
+        action[DOMAIN_ID_ACTION_COLUMN] = sample_domain_id(sample)
+    return action
+
+
+def sample_domain_id(sample: dict[str, Any]) -> float:
+    """Map manifest data_domain to the JEPA-style domain action token.
+
+    The mixed JEPA data uses 0 for old/KDS servo and 1 for current/TowerPro
+    servo. Older single-domain NN-JEPA manifests have no data_domain; those are
+    treated as current-servo data for backward compatibility.
+    """
+    raw_value = sample.get("data_domain")
+    raw_domain = str(raw_value or "").strip().lower()
+    if not raw_domain:
+        if "missing" not in _WARNED_DOMAIN_KEYS:
+            warnings.warn(
+                "Manifest sample is missing data_domain; using domain_id=1.0 for backward compatibility.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _WARNED_DOMAIN_KEYS.add("missing")
+        return DEFAULT_DOMAIN_ID
+    if raw_domain not in DOMAIN_ID_BY_DATA_DOMAIN:
+        if raw_domain not in _WARNED_DOMAIN_KEYS:
+            warnings.warn(
+                f"Unknown data_domain={raw_value!r}; using domain_id=1.0 fallback.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _WARNED_DOMAIN_KEYS.add(raw_domain)
+        return DEFAULT_DOMAIN_ID
+    return float(DOMAIN_ID_BY_DATA_DOMAIN[raw_domain])
 
 
 def sample_sort_key(sample: dict[str, Any]) -> tuple[float, int]:

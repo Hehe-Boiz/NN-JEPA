@@ -1,0 +1,132 @@
+{
+  "checkpoint": "/home/heheboiz/data/NN-JEPA/checkpoints/rc_jepa_ac_vitb_features_servo_old_mix_official_lite_base_frame_stride2/best.pt",
+  "checkpoint_phase": "epoch_complete",
+  "features_dir": "data/experiments/servo_old_mix_v1/features/vjepa2_1_vitb_384_ema_fp16",
+  "manifest_dir": "data/experiments/servo_old_mix_v1/processed/manifests",
+  "split": "val",
+  "eval_batch_size": 64,
+  "num_workers": 4,
+  "max_batches": 256,
+  "horizons": [
+    1,
+    2,
+    3
+  ],
+  "rollout_state_mode": "measured",
+  "variants": [
+    "zero",
+    "shuffle",
+    "opposite"
+  ],
+  "amp_dtype": "fp32",
+  "device": "cuda",
+  "fixed_state_context": true,
+  "zero_variant_note": "zero is in model action space; with normalized actions this means train-set mean command.",
+  "model": {
+    "state_columns": [
+      "yaw_rate_t",
+      "accel_x_t",
+      "accel_y_t",
+      "steering_last_t",
+      "throttle_last_t"
+    ],
+    "action_columns": [
+      "steering_cmd_t",
+      "throttle_cmd_t"
+    ],
+    "raw_frames_per_sample": 8,
+    "sequence_stride": 1,
+    "frame_stride": 2,
+    "target_fps": 0.0,
+    "auto_steps": 2,
+    "rollout_state_mode": "legacy_repeat",
+    "predictor_type": "official_lite",
+    "predictor_dim": 512,
+    "predictor_depth": 6,
+    "predictor_heads": 8,
+    "dropout": 0.0,
+    "tokens_per_frame": 576,
+    "embed_dim": 768,
+    "feature_metadata": {
+      "format_version": 1,
+      "feature_layout": "frame_tokens",
+      "encoder_preset": "vitb_384",
+      "encoder_name": "vit_base_384",
+      "checkpoint_path": "checkpoints/vjepa2_1/vjepa2_1_vitb_dist_vitG_384.pt",
+      "checkpoint_key": "ema_encoder",
+      "image_size": 384,
+      "patch_size": 16,
+      "tubelet_size": 2,
+      "tokens_per_frame": 576,
+      "embed_dim": 768,
+      "dtype": "fp16",
+      "image_path_key": "source_frame_path",
+      "image_path_fallback": true,
+      "normalization_mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "normalization_std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "manifest_dir": "data/experiments/servo_old_mix_v1/processed/manifests",
+      "splits": [
+        "train",
+        "val"
+      ],
+      "session_count": 211,
+      "frame_count": 212840
+    }
+  },
+  "sequence_count": 20501,
+  "metrics": {
+    "action_sens/loss_normal_h1": 0.2464460170907771,
+    "action_sens/identity_loss_h1": 0.30627154342738794,
+    "action_sens/model_vs_identity_ratio_h1": 0.8046650835819669,
+    "action_sens/loss_opposite_h1": 0.26418414674627155,
+    "action_sens/gain_opposite_h1": 1.0719757205447582,
+    "action_sens/loss_shuffle_h1": 0.26199291264956964,
+    "action_sens/gain_shuffle_h1": 1.0630843855474683,
+    "action_sens/loss_zero_h1": 0.2604670308727538,
+    "action_sens/gain_zero_h1": 1.0568928398498407,
+    "action_sens/diff_normal_opposite_h1": 0.06417626423655731,
+    "action_sens/diff_normal_shuffle_h1": 0.06548950046607822,
+    "action_sens/diff_normal_zero_h1": 0.06362563244291396,
+    "action_sens/sampled_samples_h1": 15490.0,
+    "action_sens/loss_normal_h2": 0.2666611715160392,
+    "action_sens/identity_loss_h2": 0.3413590398582818,
+    "action_sens/model_vs_identity_ratio_h2": 0.7811750690028478,
+    "action_sens/loss_opposite_h2": 0.28895891850959726,
+    "action_sens/gain_opposite_h2": 1.0836182743321403,
+    "action_sens/loss_shuffle_h2": 0.2866661935409782,
+    "action_sens/gain_shuffle_h2": 1.0750203785245718,
+    "action_sens/loss_zero_h2": 0.2856028902061221,
+    "action_sens/gain_zero_h2": 1.071032908849812,
+    "action_sens/diff_normal_opposite_h2": 0.08474495659306948,
+    "action_sens/diff_normal_shuffle_h2": 0.08435978195796859,
+    "action_sens/diff_normal_zero_h2": 0.08446772867167973,
+    "action_sens/sampled_samples_h2": 15490.0,
+    "action_sens/loss_normal_h3": 0.2796425070125415,
+    "action_sens/identity_loss_h3": 0.36067919926230874,
+    "action_sens/model_vs_identity_ratio_h3": 0.7753219691750723,
+    "action_sens/loss_opposite_h3": 0.3043087873249534,
+    "action_sens/gain_opposite_h3": 1.0882064768190112,
+    "action_sens/loss_shuffle_h3": 0.3010316423711044,
+    "action_sens/gain_shuffle_h3": 1.0764874252740255,
+    "action_sens/loss_zero_h3": 0.3007517546203692,
+    "action_sens/gain_zero_h3": 1.0754865482838807,
+    "action_sens/diff_normal_opposite_h3": 0.09986679351779171,
+    "action_sens/diff_normal_shuffle_h3": 0.09665100722801567,
+    "action_sens/diff_normal_zero_h3": 0.0999363761801655,
+    "action_sens/sampled_samples_h3": 15490.0
+  },
+  "warnings": [],
+  "interpretation": [
+    "h1: Model reacts to action, but loss gain is weak; reaction may not be causally correct.",
+    "h2: Model reacts to action, but loss gain is weak; reaction may not be causally correct.",
+    "h3: Model reacts to action, but loss gain is weak; reaction may not be causally correct."
+  ]
+}

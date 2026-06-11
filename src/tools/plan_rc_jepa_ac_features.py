@@ -18,6 +18,7 @@ from data.feature_sequence_dataset import create_ac_feature_sequence_dataloaders
 from tools.rc_jepa_ac_cem_planner import (
     RCJepaACFeatureCEMPlanner,
     denormalize_action_tensor,
+    make_zero_control_actions,
 )
 from tools.rc_jepa_ac_feature_runtime import (
     DEFAULT_FEATURES_DIR,
@@ -100,6 +101,23 @@ def resolve_action_bounds(
     return [float(value) for value in resolved]
 
 
+def default_action_bounds(action_columns: tuple[str, ...]) -> tuple[list[float], list[float]]:
+    low_by_column = {
+        "steering_cmd_t": settings.STEERING_MIN,
+        "throttle_cmd_t": settings.THROTTLE_MIN,
+        "domain_id": 0.0,
+    }
+    high_by_column = {
+        "steering_cmd_t": settings.STEERING_MAX,
+        "throttle_cmd_t": settings.THROTTLE_MAX,
+        "domain_id": 1.0,
+    }
+    return (
+        [float(low_by_column.get(column, -1.0)) for column in action_columns],
+        [float(high_by_column.get(column, 1.0)) for column in action_columns],
+    )
+
+
 def tensor_to_list(value: torch.Tensor) -> Any:
     return value.detach().cpu().tolist()
 
@@ -158,15 +176,16 @@ def main() -> None:
     horizon = resolve_horizon(args.horizon, config.auto_steps, config.raw_frames_per_sample)
     goal_offset = resolve_goal_offset(args.goal_offset, horizon, config.raw_frames_per_sample)
     action_dim = len(config.action_columns)
+    default_low, default_high = default_action_bounds(config.action_columns)
     action_low = resolve_action_bounds(
         args.action_low,
-        [settings.STEERING_MIN, settings.THROTTLE_MIN],
+        default_low,
         action_dim,
         "--action-low",
     )
     action_high = resolve_action_bounds(
         args.action_high,
-        [settings.STEERING_MAX, settings.THROTTLE_MAX],
+        default_high,
         action_dim,
         "--action-high",
     )
@@ -210,6 +229,7 @@ def main() -> None:
         action_penalty=args.action_penalty,
         smooth_penalty=args.smooth_penalty,
         device=device,
+        rollout_feedback_norm=config.rollout_feedback_norm,
     )
 
     run_config: dict[str, Any] = {
@@ -253,18 +273,22 @@ def main() -> None:
             goal_tokens = latents[0, goal_start:goal_end]
             initial_state = states[0, 0]
 
-            plan = planner.plan(
-                context_tokens=context_tokens,
-                initial_state=initial_state,
-                goal_tokens=goal_tokens,
-            )
-            planned_actions = plan.action_sequence.to(device).unsqueeze(0)
             groundtruth_actions = denormalize_action_tensor(
                 model_actions[:, :horizon],
                 action_columns=config.action_columns,
                 action_normalizer=action_normalizer,
             )
-            zero_actions = torch.zeros_like(planned_actions)
+            plan = planner.plan(
+                context_tokens=context_tokens,
+                initial_state=initial_state,
+                goal_tokens=goal_tokens,
+                reference_actions=groundtruth_actions[0],
+            )
+            planned_actions = plan.action_sequence.to(device).unsqueeze(0)
+            zero_actions = make_zero_control_actions(
+                groundtruth_actions,
+                action_columns=config.action_columns,
+            )
 
             planned_predictions = planner.rollout(context_tokens, initial_state, planned_actions)
             groundtruth_predictions = planner.rollout(context_tokens, initial_state, groundtruth_actions)
