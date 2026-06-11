@@ -41,6 +41,7 @@ class HydraTrainConfigTests(unittest.TestCase):
                     "warmup_start_factor": 0.1,
                     "min_lr_ratio": 0.1,
                     "early_stopping_patience": 2,
+                    "rollout_eval_state_mode": "both",
                     "resume_from": None,
                     "seed": 123,
                     "device": "cpu",
@@ -73,6 +74,7 @@ class HydraTrainConfigTests(unittest.TestCase):
         self.assertTrue(args._output_dir_was_provided)
         self.assertEqual(args.state_columns, ["yaw_rate_t", "accel_x_t"])
         self.assertEqual(args.rollout_state_mode, "measured_train")
+        self.assertEqual(args.rollout_eval_state_mode, "both")
         self.assertEqual(args.batch_size, 4)
         self.assertEqual(args.device, "cpu")
         self.assertFalse(args.skip_test)

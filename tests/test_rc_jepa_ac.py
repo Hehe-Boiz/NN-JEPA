@@ -46,6 +46,13 @@ if TORCH_AVAILABLE:
         should_apply_early_stopping,
         sync_lr_scheduler,
     )
+    from tools.train_rc_jepa_ac_features import (
+        ROLLOUT_EVAL_STATE_MODE_BOTH,
+        ROLLOUT_EVAL_STATE_MODE_FALLBACK,
+        ROLLOUT_EVAL_STATE_MODE_MEASURED,
+        final_rollout_identity_eval,
+        flatten_rollout_eval_metric_keys,
+    )
     from tools.wandb_utils import persist_wandb_run_id, read_saved_wandb_run_id, resolve_wandb_run_id
     from tools.wandb_utils import init_wandb
 
@@ -470,6 +477,114 @@ class RCJepaACTests(unittest.TestCase):
                     self.assertTrue(torch.isfinite(first_grad).all())
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_rollout_eval_measured_mode_does_not_call_fallback_helper(self) -> None:
+        from tools import train_rc_jepa_ac_features as feature_train
+
+        predictor = RecordingRolloutPredictor()
+        dataloader = make_rollout_eval_loader(num_frames=4)
+        original_helper = feature_train.build_rollout_state_context
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("measured rollout eval must not call build_rollout_state_context")
+
+        feature_train.build_rollout_state_context = fail_if_called
+        try:
+            metrics = final_rollout_identity_eval(
+                predictor=predictor,
+                dataloader=dataloader,
+                device=torch.device("cpu"),
+                tokens_per_frame=1,
+                horizon=2,
+                state_columns=tuple(settings.AC_STATE_COLUMNS),
+                action_columns=tuple(settings.AC_ACTION_COLUMNS),
+                show_progress=False,
+                rollout_eval_state_mode=ROLLOUT_EVAL_STATE_MODE_MEASURED,
+            )
+        finally:
+            feature_train.build_rollout_state_context = original_helper
+
+        self.assertIn("measured/rollout_l1_h1", metrics)
+        self.assertIn("measured/ratio_h2", metrics)
+        self.assertNotIn("fallback/rollout_l1_h1", metrics)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_rollout_eval_fallback_mode_calls_fallback_helper(self) -> None:
+        from tools import train_rc_jepa_ac_features as feature_train
+
+        predictor = RecordingRolloutPredictor()
+        dataloader = make_rollout_eval_loader(num_frames=4)
+        original_helper = feature_train.build_rollout_state_context
+        call_count = {"value": 0}
+
+        def counting_helper(*args, **kwargs):
+            call_count["value"] += 1
+            return original_helper(*args, **kwargs)
+
+        feature_train.build_rollout_state_context = counting_helper
+        try:
+            metrics = final_rollout_identity_eval(
+                predictor=predictor,
+                dataloader=dataloader,
+                device=torch.device("cpu"),
+                tokens_per_frame=1,
+                horizon=2,
+                state_columns=tuple(settings.AC_STATE_COLUMNS),
+                action_columns=tuple(settings.AC_ACTION_COLUMNS),
+                show_progress=False,
+                rollout_eval_state_mode=ROLLOUT_EVAL_STATE_MODE_FALLBACK,
+            )
+        finally:
+            feature_train.build_rollout_state_context = original_helper
+
+        self.assertGreater(call_count["value"], 0)
+        self.assertIn("fallback/rollout_l1_h1", metrics)
+        self.assertIn("fallback/ratio_h2", metrics)
+        self.assertNotIn("measured/rollout_l1_h1", metrics)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_rollout_eval_both_mode_returns_measured_and_fallback_metrics(self) -> None:
+        predictor = RecordingRolloutPredictor()
+        metrics = final_rollout_identity_eval(
+            predictor=predictor,
+            dataloader=make_rollout_eval_loader(num_frames=4),
+            device=torch.device("cpu"),
+            tokens_per_frame=1,
+            horizon=2,
+            state_columns=tuple(settings.AC_STATE_COLUMNS),
+            action_columns=tuple(settings.AC_ACTION_COLUMNS),
+            show_progress=False,
+            rollout_eval_state_mode=ROLLOUT_EVAL_STATE_MODE_BOTH,
+        )
+
+        self.assertIn("measured/rollout_l1_h1", metrics)
+        self.assertIn("measured/identity_l1_h2", metrics)
+        self.assertIn("fallback/rollout_l1_h1", metrics)
+        self.assertIn("fallback/identity_l1_h2", metrics)
+
+        flat = flatten_rollout_eval_metric_keys(metrics)
+        self.assertIn("measured_rollout_l1_h1", flat)
+        self.assertIn("fallback_ratio_h2", flat)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
+    def test_rollout_eval_modes_run_for_horizons_one_two_four(self) -> None:
+        for horizon in (1, 2, 4):
+            with self.subTest(horizon=horizon):
+                metrics = final_rollout_identity_eval(
+                    predictor=RecordingRolloutPredictor(),
+                    dataloader=make_rollout_eval_loader(num_frames=5),
+                    device=torch.device("cpu"),
+                    tokens_per_frame=1,
+                    horizon=horizon,
+                    state_columns=tuple(settings.AC_STATE_COLUMNS),
+                    action_columns=tuple(settings.AC_ACTION_COLUMNS),
+                    show_progress=False,
+                    rollout_eval_state_mode=ROLLOUT_EVAL_STATE_MODE_BOTH,
+                )
+
+                self.assertIn(f"measured/rollout_l1_h{horizon}", metrics)
+                self.assertIn(f"fallback/rollout_l1_h{horizon}", metrics)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed in this environment")
     def test_action_normalization_round_trip_for_planner(self) -> None:
         normalizer = FeatureNormalizer(
             {
@@ -801,6 +916,29 @@ def make_manifest_sample(session_id: str, frame_index: int, image_path: Path) ->
             "throttle_cmd_t": 0.2,
         },
     }
+
+
+def make_rollout_eval_loader(num_frames: int):
+    tokens_per_frame = 1
+    latent_dim = 1
+    state_dim = len(settings.AC_STATE_COLUMNS)
+    action_dim = len(settings.AC_ACTION_COLUMNS)
+    latents = torch.arange(num_frames * tokens_per_frame * latent_dim, dtype=torch.float32).view(
+        num_frames * tokens_per_frame,
+        latent_dim,
+    )
+    states = torch.arange(num_frames * state_dim, dtype=torch.float32).view(num_frames, state_dim)
+    actions = torch.arange((num_frames - 1) * action_dim, dtype=torch.float32).view(num_frames - 1, action_dim)
+    return torch.utils.data.DataLoader(
+        [
+            {
+                "latents": latents,
+                "states": states,
+                "actions": actions,
+            }
+        ],
+        batch_size=1,
+    )
 
 
 class ToyPlannerPredictor(torch.nn.Module if TORCH_AVAILABLE else object):

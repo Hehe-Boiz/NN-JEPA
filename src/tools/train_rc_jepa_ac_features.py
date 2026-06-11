@@ -74,6 +74,15 @@ from tools.wandb_utils import (
 
 DEFAULT_FEATURES_DIR = settings.PROCESSED_DATA_DIR / "features" / "vjepa2_1_vitb_384_ema_fp16"
 DEFAULT_OUTPUT_DIR = Path("checkpoints/rc_jepa_ac_vitb_features_20260607")
+ROLLOUT_EVAL_STATE_MODE_MEASURED = "measured"
+ROLLOUT_EVAL_STATE_MODE_FALLBACK = "fallback"
+ROLLOUT_EVAL_STATE_MODE_BOTH = "both"
+SUPPORTED_ROLLOUT_EVAL_STATE_MODES = (
+    ROLLOUT_EVAL_STATE_MODE_MEASURED,
+    ROLLOUT_EVAL_STATE_MODE_FALLBACK,
+    ROLLOUT_EVAL_STATE_MODE_BOTH,
+)
+DEFAULT_ROLLOUT_EVAL_STATE_MODE = ROLLOUT_EVAL_STATE_MODE_BOTH
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -95,6 +104,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "State conditioning used during training rollout. measured_train uses measured "
             "states[:, :k+1]; legacy_repeat repeats state_0 and only copies previous action."
+        ),
+    )
+    parser.add_argument(
+        "--rollout-eval-state-mode",
+        choices=SUPPORTED_ROLLOUT_EVAL_STATE_MODES,
+        default=DEFAULT_ROLLOUT_EVAL_STATE_MODE,
+        help=(
+            "State conditioning for rollout-vs-identity evaluation. measured uses measured future "
+            "states from the batch; fallback uses inference/planning-style repeated initial state; "
+            "both logs both side by side."
         ),
     )
     parser.add_argument("--predictor-type", choices=SUPPORTED_PREDICTOR_TYPES, default=DEFAULT_PREDICTOR_TYPE)
@@ -407,6 +426,70 @@ def average_metrics(totals: dict[str, float], total_samples: int) -> dict[str, f
     return {key: value / max(total_samples, 1) for key, value in totals.items()}
 
 
+def expand_rollout_eval_state_modes(mode: str) -> tuple[str, ...]:
+    if mode not in SUPPORTED_ROLLOUT_EVAL_STATE_MODES:
+        available = ", ".join(SUPPORTED_ROLLOUT_EVAL_STATE_MODES)
+        raise ValueError(f"Unknown rollout_eval_state_mode={mode!r}. Available: {available}")
+    if mode == ROLLOUT_EVAL_STATE_MODE_BOTH:
+        return (ROLLOUT_EVAL_STATE_MODE_MEASURED, ROLLOUT_EVAL_STATE_MODE_FALLBACK)
+    return (mode,)
+
+
+def build_rollout_eval_state_context(
+    mode: str,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    rollout_steps: int,
+    state_columns: tuple[str, ...],
+    action_columns: tuple[str, ...],
+) -> torch.Tensor:
+    """Return rollout state context for eval with explicit measured/fallback semantics."""
+    if mode == ROLLOUT_EVAL_STATE_MODE_MEASURED:
+        return states[:, :rollout_steps]
+    if mode == ROLLOUT_EVAL_STATE_MODE_FALLBACK:
+        return build_rollout_state_context(
+            initial_state=states[:, :1],
+            actions=actions,
+            rollout_steps=rollout_steps,
+            state_columns=state_columns,
+            action_columns=action_columns,
+        )
+    raise ValueError(f"Unsupported rollout eval state mode: {mode!r}")
+
+
+def flatten_rollout_eval_metric_keys(metrics: dict[str, float]) -> dict[str, float]:
+    """Convert measured/rollout_l1_h1 to measured_rollout_l1_h1 for JSON summaries."""
+    flattened: dict[str, float] = {}
+    for key, value in metrics.items():
+        if key.startswith(f"{ROLLOUT_EVAL_STATE_MODE_MEASURED}/"):
+            flattened[f"measured_{key.split('/', 1)[1]}"] = value
+        elif key.startswith(f"{ROLLOUT_EVAL_STATE_MODE_FALLBACK}/"):
+            flattened[f"fallback_{key.split('/', 1)[1]}"] = value
+        else:
+            flattened[key] = value
+    return flattened
+
+
+def format_rollout_eval_suffix(metrics: dict[str, float], label_prefix: str) -> str:
+    parts: list[str] = []
+    for mode in (ROLLOUT_EVAL_STATE_MODE_MEASURED, ROLLOUT_EVAL_STATE_MODE_FALLBACK):
+        steps = sorted(
+            int(key.rsplit("h", 1)[1])
+            for key in metrics
+            if key.startswith(f"{mode}/ratio_h")
+        )
+        for step in steps:
+            for metric_name, precision in (
+                ("rollout_l1", 5),
+                ("identity_l1", 5),
+                ("ratio", 3),
+            ):
+                key = f"{mode}/{metric_name}_h{step}"
+                if key in metrics:
+                    parts.append(f"{label_prefix}_{mode}_{metric_name}_h{step}={metrics[key]:.{precision}f}")
+    return "" if not parts else " " + " ".join(parts)
+
+
 @torch.no_grad()
 def final_rollout_identity_eval(
     predictor: nn.Module,
@@ -420,19 +503,23 @@ def final_rollout_identity_eval(
     amp_dtype: str = "fp32",
     max_batches: int = 0,
     label: str = "final val rollout",
+    rollout_eval_state_mode: str = DEFAULT_ROLLOUT_EVAL_STATE_MODE,
 ) -> dict[str, float]:
     """Compare autoregressive rollout against an identity latent baseline on val."""
     if horizon < 1:
         return {}
 
+    modes = expand_rollout_eval_state_modes(rollout_eval_state_mode)
     predictor.eval()
-    model_totals: dict[int, float] = {}
-    identity_totals: dict[int, float] = {}
-    count = 0
+    model_totals_by_mode: dict[str, dict[int, float]] = {mode: {} for mode in modes}
+    identity_totals_by_mode: dict[str, dict[int, float]] = {mode: {} for mode in modes}
+    counts_by_mode: dict[str, int] = {mode: 0 for mode in modes}
+    sampled_batches = 0
     progress = tqdm(dataloader, desc=label, leave=False, disable=not show_progress)
     for batch_index, batch in enumerate(progress, start=1):
         if max_batches > 0 and batch_index > max_batches:
             break
+        sampled_batches += 1
         latents = batch["latents"].to(device, non_blocking=True)
         states = batch["states"].to(device, non_blocking=True)
         actions = batch["actions"].to(device, non_blocking=True)
@@ -443,47 +530,56 @@ def final_rollout_identity_eval(
             continue
 
         first_tokens = latents[:, :tokens_per_frame]
-        rollout_tokens = first_tokens
-        rollout_states = build_rollout_state_context(
-            initial_state=states[:, :1],
-            actions=actions,
-            rollout_steps=max_horizon,
-            state_columns=state_columns,
-            action_columns=action_columns,
-        )
 
-        predictions: list[torch.Tensor] = []
-        for step in range(max_horizon):
-            with autocast_context(device, amp_dtype):
-                pred_tokens = predictor(
-                    latent_tokens=rollout_tokens,
-                    actions=actions[:, : step + 1],
-                    states=rollout_states[:, : step + 1],
-                    tokens_per_frame=tokens_per_frame,
-                )
-            next_tokens = pred_tokens[:, -tokens_per_frame:]
-            predictions.append(next_tokens)
-            rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+        for mode in modes:
+            rollout_tokens = first_tokens
+            rollout_states = build_rollout_eval_state_context(
+                mode=mode,
+                states=states,
+                actions=actions,
+                rollout_steps=max_horizon,
+                state_columns=state_columns,
+                action_columns=action_columns,
+            )
 
-        for step, predicted in enumerate(predictions, start=1):
-            target_start = step * tokens_per_frame
-            target = latents[:, target_start : target_start + tokens_per_frame]
-            model_l1 = torch.nn.functional.l1_loss(predicted, target, reduction="none").mean(dim=(1, 2))
-            identity_l1 = torch.nn.functional.l1_loss(first_tokens, target, reduction="none").mean(dim=(1, 2))
-            model_totals[step] = model_totals.get(step, 0.0) + float(model_l1.sum().detach().cpu())
-            identity_totals[step] = identity_totals.get(step, 0.0) + float(identity_l1.sum().detach().cpu())
-        count += batch_size
+            predictions: list[torch.Tensor] = []
+            for step in range(max_horizon):
+                with autocast_context(device, amp_dtype):
+                    pred_tokens = predictor(
+                        latent_tokens=rollout_tokens,
+                        actions=actions[:, : step + 1],
+                        states=rollout_states[:, : step + 1],
+                        tokens_per_frame=tokens_per_frame,
+                    )
+                next_tokens = pred_tokens[:, -tokens_per_frame:]
+                predictions.append(next_tokens)
+                rollout_tokens = torch.cat([rollout_tokens, next_tokens], dim=1)
+
+            model_totals = model_totals_by_mode[mode]
+            identity_totals = identity_totals_by_mode[mode]
+            for step, predicted in enumerate(predictions, start=1):
+                target_start = step * tokens_per_frame
+                target = latents[:, target_start : target_start + tokens_per_frame]
+                model_l1 = torch.nn.functional.l1_loss(predicted, target, reduction="none").mean(dim=(1, 2))
+                identity_l1 = torch.nn.functional.l1_loss(first_tokens, target, reduction="none").mean(dim=(1, 2))
+                model_totals[step] = model_totals.get(step, 0.0) + float(model_l1.sum().detach().cpu())
+                identity_totals[step] = identity_totals.get(step, 0.0) + float(identity_l1.sum().detach().cpu())
+            counts_by_mode[mode] += batch_size
 
     metrics: dict[str, float] = {}
-    for step in sorted(model_totals):
-        model_l1 = model_totals[step] / max(count, 1)
-        identity_l1 = identity_totals[step] / max(count, 1)
-        metrics[f"rollout_l1_h{step}"] = model_l1
-        metrics[f"identity_l1_h{step}"] = identity_l1
-        metrics[f"ratio_h{step}"] = model_l1 / max(identity_l1, 1e-12)
-    if max_batches > 0:
-        metrics["sampled_batches"] = float(min(max_batches, len(dataloader)))
-    metrics["sampled_samples"] = float(count)
+    for mode in modes:
+        model_totals = model_totals_by_mode[mode]
+        identity_totals = identity_totals_by_mode[mode]
+        count = counts_by_mode[mode]
+        for step in sorted(model_totals):
+            model_l1 = model_totals[step] / max(count, 1)
+            identity_l1 = identity_totals[step] / max(count, 1)
+            metrics[f"{mode}/rollout_l1_h{step}"] = model_l1
+            metrics[f"{mode}/identity_l1_h{step}"] = identity_l1
+            metrics[f"{mode}/ratio_h{step}"] = model_l1 / max(identity_l1, 1e-12)
+        if max_batches > 0:
+            metrics[f"{mode}/sampled_batches"] = float(sampled_batches)
+        metrics[f"{mode}/sampled_samples"] = float(count)
     return metrics
 
 
@@ -540,7 +636,7 @@ def final_planning_eval(
     smooth_penalty: float,
     show_progress: bool,
 ) -> dict[str, float]:
-    """Run a small offline CEM planning eval on val using the trained world model."""
+    """Run a small offline CEM planning eval on val using fallback rollout states."""
     if max_samples < 1:
         return {}
     if horizon < 1:
@@ -554,6 +650,11 @@ def final_planning_eval(
     if cem_iters < 1:
         raise ValueError("final planning CEM iters must be >= 1")
 
+    print(
+        "[final planning] CEM planner uses fallback rollout states; dynamic IMU states are "
+        "stale/approximated unless a state prediction/update model is added.",
+        flush=True,
+    )
     predictor.eval()
     action_low, action_high = action_bounds_for_columns(action_columns)
     split_dataset = dataloader.dataset
@@ -732,14 +833,15 @@ def jepa_style_val_epoch_metrics(val_metrics: dict[str, float]) -> dict[str, flo
 def jepa_style_final_summary(best_val_loss: float, final_eval_metrics: dict[str, float]) -> dict[str, float]:
     """Summary keys used by JEPA, extended to horizon 3 when available."""
     metrics: dict[str, float] = {"final/best_val": float(best_val_loss)}
-    if "rollout_l1_h1" in final_eval_metrics:
-        metrics["final/rollout1"] = float(final_eval_metrics["rollout_l1_h1"])
-    if "ratio_h1" in final_eval_metrics:
-        metrics["final/rollout1_ratio"] = float(final_eval_metrics["ratio_h1"])
-    if "rollout_l1_h3" in final_eval_metrics:
-        metrics["final/rollout3"] = float(final_eval_metrics["rollout_l1_h3"])
-    if "ratio_h3" in final_eval_metrics:
-        metrics["final/rollout3_ratio"] = float(final_eval_metrics["ratio_h3"])
+    for mode in (ROLLOUT_EVAL_STATE_MODE_MEASURED, ROLLOUT_EVAL_STATE_MODE_FALLBACK):
+        if f"{mode}/rollout_l1_h1" in final_eval_metrics:
+            metrics[f"final/{mode}_rollout1"] = float(final_eval_metrics[f"{mode}/rollout_l1_h1"])
+        if f"{mode}/ratio_h1" in final_eval_metrics:
+            metrics[f"final/{mode}_rollout1_ratio"] = float(final_eval_metrics[f"{mode}/ratio_h1"])
+        if f"{mode}/rollout_l1_h3" in final_eval_metrics:
+            metrics[f"final/{mode}_rollout3"] = float(final_eval_metrics[f"{mode}/rollout_l1_h3"])
+        if f"{mode}/ratio_h3" in final_eval_metrics:
+            metrics[f"final/{mode}_rollout3_ratio"] = float(final_eval_metrics[f"{mode}/ratio_h3"])
     return metrics
 
 
@@ -1066,30 +1168,14 @@ def main(args: argparse.Namespace | None = None) -> None:
                     amp_dtype=args.amp_dtype,
                     max_batches=args.val_rollout_eval_max_batches,
                     label=f"epoch {epoch:03d}/{args.epochs:03d} val rollout",
+                    rollout_eval_state_mode=args.rollout_eval_state_mode,
                 )
                 val_metrics.update(val_rollout_metrics)
 
             epoch_metrics = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
             history.append(epoch_metrics)
             write_json(args.output_dir / "history.json", history)
-            rollout_suffix = ""
-            rollout_steps = sorted(
-                int(key.removeprefix("ratio_h"))
-                for key in val_metrics
-                if key.startswith("ratio_h")
-            )
-            if rollout_steps:
-                rollout_parts: list[str] = []
-                for step in rollout_steps:
-                    for prefix, precision in (
-                        ("rollout_l1", 5),
-                        ("identity_l1", 5),
-                        ("ratio", 3),
-                    ):
-                        key = f"{prefix}_h{step}"
-                        if key in val_metrics:
-                            rollout_parts.append(f"val_{key}={val_metrics[key]:.{precision}f}")
-                rollout_suffix = " " + " ".join(rollout_parts)
+            rollout_suffix = format_rollout_eval_suffix(val_metrics, label_prefix="val")
             print(
                 f"[epoch {epoch:03d}] "
                 f"train_loss={train_metrics['loss']:.5f} "
@@ -1206,39 +1292,36 @@ def main(args: argparse.Namespace | None = None) -> None:
                 action_columns=tuple(args.action_columns),
                 show_progress=not args.no_progress,
                 amp_dtype=args.amp_dtype,
+                rollout_eval_state_mode=args.rollout_eval_state_mode,
             )
             final_eval_payload = {
                 "split": "val",
                 "horizon": args.final_eval_horizon,
+                "rollout_eval_state_mode": args.rollout_eval_state_mode,
                 "metrics": final_eval_metrics,
+                "flat_metrics": flatten_rollout_eval_metric_keys(final_eval_metrics),
             }
+            write_json(args.output_dir / "final_rollout_val.json", final_eval_payload)
             write_json(args.output_dir / "final_eval_val.json", final_eval_payload)
-            result["final_eval_val"] = final_eval_metrics
+            result["final_rollout_val"] = final_eval_metrics
             log_metrics(
                 wandb_run,
-                flatten_metrics("final_eval_val", final_eval_metrics),
+                flatten_metrics("final_rollout", final_eval_metrics),
                 step=max(global_step, 1),
             )
             update_summary(
                 wandb_run,
-                {f"final_eval_val/{key}": value for key, value in final_eval_metrics.items()},
+                {f"final_rollout/{key}": value for key, value in final_eval_metrics.items()},
             )
             jepa_final_metrics = jepa_style_final_summary(best_val_loss, final_eval_metrics)
             result["final"] = jepa_final_metrics
             log_metrics(wandb_run, jepa_final_metrics, step=max(global_step, 1))
             update_summary(wandb_run, jepa_final_metrics)
-            if "final/rollout1" in jepa_final_metrics:
-                rollout_line = (
-                    f"[final] best_val={best_val_loss:.5f} "
-                    f"rollout@1={jepa_final_metrics['final/rollout1']:.5f} "
-                    f"(x identity {jepa_final_metrics.get('final/rollout1_ratio', float('nan')):.3f})"
-                )
-                if "final/rollout3" in jepa_final_metrics:
-                    rollout_line += (
-                        f" rollout@3={jepa_final_metrics['final/rollout3']:.5f} "
-                        f"(x identity {jepa_final_metrics.get('final/rollout3_ratio', float('nan')):.3f})"
-                    )
-                print(rollout_line, flush=True)
+            rollout_line = (
+                f"[final] best_val={best_val_loss:.5f}"
+                f"{format_rollout_eval_suffix(final_eval_metrics, label_prefix='final')}"
+            )
+            print(rollout_line, flush=True)
         if args.final_planning_eval_samples > 0:
             maybe_cleanup_cuda()
             planning_horizon = resolve_positive_horizon(

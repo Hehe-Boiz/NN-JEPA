@@ -48,6 +48,7 @@ train:
   min_lr_ratio: 0.1
   early_stopping_patience: 15
   amp_dtype: bf16
+  rollout_eval_state_mode: both
   val_rollout_eval_horizon: 3
   val_rollout_eval_max_batches: 256
   final_eval_horizon: 3

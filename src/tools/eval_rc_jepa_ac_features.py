@@ -19,7 +19,14 @@ from tools.rc_jepa_ac_feature_runtime import (
     load_feature_checkpoint,
     validate_feature_metadata,
 )
-from tools.train_rc_jepa_ac_features import run_epoch, write_json
+from tools.train_rc_jepa_ac_features import (
+    DEFAULT_ROLLOUT_EVAL_STATE_MODE,
+    SUPPORTED_ROLLOUT_EVAL_STATE_MODES,
+    final_rollout_identity_eval,
+    flatten_rollout_eval_metric_keys,
+    run_epoch,
+    write_json,
+)
 from tools.wandb_utils import add_wandb_args, finish_wandb, flatten_metrics, init_wandb, log_metrics, update_summary
 
 
@@ -34,6 +41,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["train", "val", "test", "all"], default="test")
     parser.add_argument("--eval-batch-size", type=int, default=settings.AC_EVAL_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=settings.NUM_WORKERS)
+    parser.add_argument(
+        "--rollout-eval-horizon",
+        type=int,
+        default=0,
+        help="Optional rollout-vs-identity eval horizon. 0 disables this extra eval.",
+    )
+    parser.add_argument(
+        "--rollout-eval-max-batches",
+        type=int,
+        default=0,
+        help="Maximum batches for rollout-vs-identity eval. 0 means full selected split.",
+    )
+    parser.add_argument(
+        "--rollout-eval-state-mode",
+        choices=SUPPORTED_ROLLOUT_EVAL_STATE_MODES,
+        default=DEFAULT_ROLLOUT_EVAL_STATE_MODE,
+        help="State conditioning for rollout-vs-identity eval: measured, fallback, or both.",
+    )
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--no-progress", action="store_true")
@@ -80,6 +105,9 @@ def main() -> None:
         "split": args.split,
         "eval_batch_size": args.eval_batch_size,
         "num_workers": args.num_workers,
+        "rollout_eval_horizon": args.rollout_eval_horizon,
+        "rollout_eval_max_batches": args.rollout_eval_max_batches,
+        "rollout_eval_state_mode": args.rollout_eval_state_mode,
         "device": str(device),
         "model": config.to_jsonable_dict(),
         "sequence_counts": {split: len(dataloaders[split].dataset) for split in selected_splits},
@@ -107,6 +135,22 @@ def main() -> None:
                     label=f"eval {split}",
                     show_progress=not args.no_progress,
                 )
+                if args.rollout_eval_horizon > 0:
+                    maybe_cleanup_cuda()
+                    rollout_metrics = final_rollout_identity_eval(
+                        predictor=predictor,
+                        dataloader=dataloaders[split],
+                        device=device,
+                        tokens_per_frame=config.tokens_per_frame,
+                        horizon=args.rollout_eval_horizon,
+                        state_columns=config.state_columns,
+                        action_columns=config.action_columns,
+                        show_progress=not args.no_progress,
+                        max_batches=args.rollout_eval_max_batches,
+                        label=f"eval {split} rollout",
+                        rollout_eval_state_mode=args.rollout_eval_state_mode,
+                    )
+                    metrics.update(flatten_rollout_eval_metric_keys(rollout_metrics))
                 metrics_by_split[split] = metrics
                 log_metrics(wandb_run, flatten_metrics(split, metrics), step=1)
 
@@ -115,6 +159,9 @@ def main() -> None:
             "features_dir": str(features_dir),
             "manifest_dir": str(manifest_dir),
             "eval_batch_size": args.eval_batch_size,
+            "rollout_eval_horizon": args.rollout_eval_horizon,
+            "rollout_eval_max_batches": args.rollout_eval_max_batches,
+            "rollout_eval_state_mode": args.rollout_eval_state_mode,
             "metrics": metrics_by_split,
         }
         output_path = output_dir / f"eval_{args.split}.json"

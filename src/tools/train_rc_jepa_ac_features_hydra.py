@@ -60,6 +60,9 @@ def build_train_args(cfg: Any) -> Namespace:
     args.early_stopping_patience = int(train_cfg.get("early_stopping_patience", args.early_stopping_patience))
     args.amp_dtype = str(train_cfg.get("amp_dtype", args.amp_dtype))
     args.final_eval_horizon = int(train_cfg.get("final_eval_horizon", args.final_eval_horizon))
+    args.rollout_eval_state_mode = str(
+        train_cfg.get("rollout_eval_state_mode", args.rollout_eval_state_mode)
+    )
     args.val_rollout_eval_horizon = int(
         train_cfg.get("val_rollout_eval_horizon", args.val_rollout_eval_horizon)
     )

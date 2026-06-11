@@ -27,6 +27,12 @@ from tools.rc_jepa_ac_feature_runtime import (
 
 
 DEFAULT_CHECKPOINT = Path("checkpoints/rc_jepa_ac_vitb_features_20260607/best.pt")
+INFER_ROLLOUT_STATE_MODE_FALLBACK = "fallback"
+INFER_ROLLOUT_STATE_MODE_MEASURED = "measured"
+SUPPORTED_INFER_ROLLOUT_STATE_MODES = (
+    INFER_ROLLOUT_STATE_MODE_FALLBACK,
+    INFER_ROLLOUT_STATE_MODE_MEASURED,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +46,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=settings.NUM_WORKERS)
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--rollout-state-mode",
+        choices=SUPPORTED_INFER_ROLLOUT_STATE_MODES,
+        default=INFER_ROLLOUT_STATE_MODE_FALLBACK,
+        help=(
+            "State conditioning for autoregressive rollout. fallback matches inference/planning; "
+            "measured is only valid for offline dataset eval with future states available."
+        ),
+    )
     parser.add_argument("--save-tensors", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
@@ -56,6 +71,7 @@ def predict_batch(
     states: torch.Tensor,
     actions: torch.Tensor,
     config: FeaturePredictorConfig,
+    rollout_state_mode: str = INFER_ROLLOUT_STATE_MODE_FALLBACK,
 ) -> dict[str, torch.Tensor]:
     tokens_per_frame = config.tokens_per_frame
     num_frames = states.size(1)
@@ -70,13 +86,23 @@ def predict_batch(
 
     rollout_steps = min(config.auto_steps, num_frames - 1)
     rollout_tokens = latents[:, :tokens_per_frame]
-    rollout_states = build_rollout_state_context(
-        initial_state=states[:, :1],
-        actions=actions,
-        rollout_steps=rollout_steps,
-        state_columns=config.state_columns,
-        action_columns=config.action_columns,
-    )
+    if rollout_state_mode == INFER_ROLLOUT_STATE_MODE_MEASURED:
+        if states.size(1) < rollout_steps:
+            raise ValueError(
+                "Measured rollout state mode requires future measured states in the batch; "
+                f"need {rollout_steps}, got {states.size(1)}"
+            )
+        rollout_states = states[:, :rollout_steps]
+    elif rollout_state_mode == INFER_ROLLOUT_STATE_MODE_FALLBACK:
+        rollout_states = build_rollout_state_context(
+            initial_state=states[:, :1],
+            actions=actions,
+            rollout_steps=rollout_steps,
+            state_columns=config.state_columns,
+            action_columns=config.action_columns,
+        )
+    else:
+        raise ValueError(f"Unsupported inference rollout_state_mode={rollout_state_mode!r}")
     rollout_predictions = []
     for step in range(rollout_steps):
         pred_tokens = predictor(
@@ -144,6 +170,18 @@ def main() -> None:
         action_columns=config.action_columns,
     )
     validate_feature_metadata(dataloaders["train"].dataset.feature_metadata, config.feature_metadata)
+    if args.rollout_state_mode == INFER_ROLLOUT_STATE_MODE_FALLBACK:
+        print(
+            "Inference uses fallback rollout states, not measured future states. "
+            "Dynamic IMU states are stale/approximated in this mode.",
+            flush=True,
+        )
+    else:
+        print(
+            "Offline inference uses measured future states from the dataset. "
+            "Do not use this mode for live closed-loop planning.",
+            flush=True,
+        )
 
     records: list[dict[str, Any]] = []
     maybe_cleanup_cuda()
@@ -159,6 +197,7 @@ def main() -> None:
                 states=states,
                 actions=actions,
                 config=config,
+                rollout_state_mode=args.rollout_state_mode,
             )
             teacher_l1 = per_sample_l1(outputs["teacher_pred"], outputs["teacher_target"]).detach().cpu()
             rollout_l1 = per_sample_l1(outputs["rollout_pred"], outputs["rollout_target"]).detach().cpu()
@@ -190,6 +229,7 @@ def main() -> None:
                         "timestamps_sec": tensor_to_list(batch["timestamps_sec"][row]),
                         "teacher_forcing_l1": float(teacher_l1[row]),
                         "rollout_l1": float(rollout_l1[row]),
+                        "rollout_state_mode": args.rollout_state_mode,
                         "tensor_path": None if tensor_path is None else str(tensor_path),
                     }
                 )
@@ -207,6 +247,7 @@ def main() -> None:
         "max_samples": args.max_samples,
         "written_samples": len(records),
         "eval_batch_size": args.eval_batch_size,
+        "rollout_state_mode": args.rollout_state_mode,
         "save_tensors": args.save_tensors,
         "output_path": str(output_path),
     }

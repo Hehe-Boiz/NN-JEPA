@@ -200,6 +200,9 @@ class RCJepaACFeatureCEMPlanner:
             action_columns=self.action_columns,
             action_normalizer=self.action_normalizer,
         )
+        # Planning has no measured future state trajectory, so it intentionally
+        # uses the fallback state approximation. Dynamic IMU columns remain
+        # stale/approximated unless a separate state update model is added.
         rollout_states = build_rollout_state_context(
             initial_state=initial_state.unsqueeze(1),
             actions=model_actions,
